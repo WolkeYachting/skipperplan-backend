@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: skipperplan-backend
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: JTC_USER
+        sync: false   # wird manuell in Render gesetzt
+      - key: JTC_PASSWORD
+        sync: false   # wird manuell in Render gesetzt
