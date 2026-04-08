@@ -3,7 +3,7 @@ app.py  –  Skipperplan Backend
 Läuft auf Render.com. Loggt sich ein, lädt alle Algolia-Daten
 und gibt eine fertige Excel-Datei mit korrekter Farbgebung zurück.
 """
-from flask import Flask, jsonify, send_file
+from flask import Flask, jsonify, send_file, request
 from flask_cors import CORS
 import requests, os, io, json, re, datetime
 from openpyxl import Workbook
@@ -28,6 +28,7 @@ HITS_PER_PAGE  = 100
 
 JTC_USER     = os.environ.get("JTC_USER",     "")
 JTC_PASSWORD = os.environ.get("JTC_PASSWORD", "")
+APP_PASSWORD  = os.environ.get("APP_PASSWORD",  "")  # Passwort für die Webseite
 
 # ── Stammskipper ──────────────────────────────────────────────────────────────
 STAMMSKIPPER = {
@@ -273,6 +274,11 @@ def build_excel(rows, skipper_data):
 @app.route("/download", methods=["GET"])
 def download():
     """Alles in einem: Login → Algolia → Excel → Download"""
+    # Passwortprüfung
+    if APP_PASSWORD:
+        provided = request.args.get("password", "")
+        if provided != APP_PASSWORD:
+            return jsonify({"error": "Falsches Passwort"}), 401
     try:
         api_key     = login()
         hits        = fetch_algolia(api_key)
