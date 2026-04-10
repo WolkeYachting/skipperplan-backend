@@ -28,7 +28,9 @@ HITS_PER_PAGE  = 100
 
 JTC_USER     = os.environ.get("JTC_USER",     "")
 JTC_PASSWORD = os.environ.get("JTC_PASSWORD", "")
-APP_PASSWORD  = os.environ.get("APP_PASSWORD",  "")  # Passwort für die Webseite
+APP_PASSWORD  = os.environ.get("APP_PASSWORD",  "")
+GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN",  "")
+GITHUB_REPO   = "wolkeyachting/Skipperplan"   # Repository wo die Excel gespeichert wird
 
 # ── Stammskipper ──────────────────────────────────────────────────────────────
 STAMMSKIPPER = {
@@ -271,6 +273,62 @@ def build_excel(rows, skipper_data):
     return buf
 
 # ── Endpunkte ─────────────────────────────────────────────────────────────────
+@app.route("/refresh", methods=["GET"])
+def refresh():
+    """Daten laden, Excel erstellen und direkt ins GitHub-Repo committen."""
+    try:
+        # Excel erstellen
+        api_key  = login()
+        hits     = fetch_algolia(api_key)
+        rows     = extract_rows(hits)
+        skipper  = build_skipper_data(hits)
+        buf      = build_excel(rows, skipper)
+        content  = buf.read()
+
+        # Aktuelle Datei-SHA aus GitHub holen (nötig für Update)
+        gh_headers = {
+            "Authorization": f"Bearer {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github+json",
+        }
+        api_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/skipperplan.xlsx"
+        existing = requests.get(api_url, headers=gh_headers, timeout=15)
+        sha = existing.json().get("sha") if existing.status_code == 200 else None
+
+        # Datei in GitHub committen
+        import base64
+        now_str = datetime.datetime.now(datetime.UTC).strftime('%d.%m.%Y %H:%M UTC')
+        payload = {
+            "message": f"Skipperplan aktualisiert: {now_str}",
+            "content": base64.b64encode(content).decode(),
+        }
+        if sha:
+            payload["sha"] = sha
+
+        resp = requests.put(api_url, headers=gh_headers, json=payload, timeout=30)
+        if resp.status_code not in (200, 201):
+            return jsonify({"error": f"GitHub Fehler: {resp.status_code} {resp.text[:200]}"}), 500
+
+        return jsonify({
+            "ok": True,
+            "updated": now_str,
+            "termine": len(hits),
+            "yachten": len(rows),
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/check", methods=["GET"])
+def check():
+    """Prüft nur das Passwort – schnelle Antwort ohne Datenabfrage."""
+    if APP_PASSWORD:
+        provided = request.args.get("password", "")
+        if provided != APP_PASSWORD:
+            return jsonify({"ok": False}), 401
+    return jsonify({"ok": True})
+
+
 @app.route("/download", methods=["GET"])
 def download():
     """Alles in einem: Login → Algolia → Excel → Download"""
