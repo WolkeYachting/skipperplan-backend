@@ -336,7 +336,7 @@ def detect_changes(new_hits, prev_compact, today):
             if changed:
                 changes.append(entry)
 
-    return changes
+    return sorted(changes, key=lambda x: x.get('start_iso', ''))
 
 # ── Fahrstatus ────────────────────────────────────────────────────────────────
 def update_sailing_status(history, new_hits, prev_compact, today):
