@@ -472,40 +472,37 @@ def check():
 
 @app.route("/refresh", methods=["GET"])
 def refresh():
-    source = request.args.get("source", "manual")
-
-    def do_refresh():
-        try:
-            now_str   = datetime.datetime.now(datetime.UTC).strftime('%d.%m.%Y %H:%M UTC')
-            today     = today_iso()
-            api_key   = login()
-            new_hits  = fetch_algolia(api_key)
-            history   = load_history()
-            prev_hits = history.get("daily_hits", [])
-            changelog = detect_changes(new_hits, prev_hits, today) if prev_hits else []
-            history   = update_sailing_status(history, new_hits, prev_hits, today)
-            if source == "daily" or not prev_hits:
-                history["daily_hits"] = new_hits
-            rows         = extract_rows(new_hits)
-            skipper_data = build_skipper_data(new_hits)
-            buf          = build_excel(rows, skipper_data, changelog,
-                                       history['currently_sailing'], history['past_trips'])
-            excel_bytes  = buf.read()
-            save_history(history, f"History: {now_str}")
-            _, sha_main = gh_get_file("skipperplan.xlsx")
-            gh_put_file("skipperplan.xlsx", excel_bytes, sha_main, f"Skipperplan: {now_str}")
-            if source == "daily":
-                _, sha_daily = gh_get_file("skipperplan_daily.xlsx")
-                gh_put_file("skipperplan_daily.xlsx", excel_bytes, sha_daily, f"Täglich: {now_str}")
-                send_notification(now_str, len(new_hits), len(rows), changelog,
-                                  len(history['currently_sailing']))
-        except Exception as e:
-            import traceback
-            print(f"[refresh error] {e}\n{traceback.format_exc()}")
-
-    import threading
-    threading.Thread(target=do_refresh, daemon=True).start()
-    return jsonify({"ok": True, "message": "Aktualisierung gestartet"}), 200
+    source  = request.args.get("source", "manual")
+    try:
+        now_str  = datetime.datetime.now(datetime.UTC).strftime('%d.%m.%Y %H:%M UTC')
+        today    = today_iso()
+        api_key  = login()
+        new_hits = fetch_algolia(api_key)
+        history  = load_history()
+        prev_hits = history.get("daily_hits", [])
+        changelog = detect_changes(new_hits, prev_hits, today) if prev_hits else []
+        history   = update_sailing_status(history, new_hits, prev_hits, today)
+        if source == "daily" or not prev_hits:
+            history["daily_hits"] = new_hits
+        rows         = extract_rows(new_hits)
+        skipper_data = build_skipper_data(new_hits)
+        buf          = build_excel(rows, skipper_data, changelog,
+                                   history['currently_sailing'], history['past_trips'])
+        excel_bytes  = buf.read()
+        save_history(history, f"History: {now_str}")
+        _, sha_main = gh_get_file("skipperplan.xlsx")
+        gh_put_file("skipperplan.xlsx", excel_bytes, sha_main, f"Skipperplan: {now_str}")
+        if source == "daily":
+            _, sha_daily = gh_get_file("skipperplan_daily.xlsx")
+            gh_put_file("skipperplan_daily.xlsx", excel_bytes, sha_daily, f"Täglich: {now_str}")
+            send_notification(now_str, len(new_hits), len(rows), changelog,
+                              len(history['currently_sailing']))
+        return jsonify({"ok": True, "updated": now_str,
+                        "termine": len(new_hits), "yachten": len(rows),
+                        "changes": len(changelog), "sailing": len(history['currently_sailing'])})
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()[-800:]}), 500
 
 @app.route("/health", methods=["GET"])
 def health():
