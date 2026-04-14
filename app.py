@@ -1,12 +1,10 @@
 """
-app.py  –  Skipperplan Backend
+app.py  –  Skipperplan Backend (xlsxwriter)
 """
-from flask import Flask, jsonify, send_file, request
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 import requests, os, io, re, datetime, json, base64
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+import xlsxwriter
 
 app = Flask(__name__)
 CORS(app, origins=["https://wolkeyachting.github.io"])
@@ -46,18 +44,6 @@ COL_WIDTHS = {
     'Baujahr':9,'Yacht Status':15,'Skipper Status':22,'Flotillenführer':15,'Bewerbungen':40,
 }
 
-COL_HEADER      = '1F4E79'
-COL_ROW_A       = 'D6E4F0'
-COL_ROW_B       = 'FFFFFF'
-COL_NO_SKIPPER  = 'B4F7B4'
-COL_CANCEL      = 'FFCCCC'
-COL_UNCONFIRMED = 'FCE4D6'
-COL_STAMM       = 'C6EFCE'
-COL_ADVANCED    = 'FFEB9C'
-COL_CHANGE      = 'FFF2CC'
-COL_NEW         = 'E2EFDA'
-COL_CANCEL_LOG  = 'FCE4D6'
-
 SKIPPER_STATUS_LABELS = {
     'confirmed_by_admin_and_skipper': 'Bestätigt',
     'confirmed_by_admin':             'Vom Admin bestätigt',
@@ -78,20 +64,6 @@ def ts_to_iso(ts):
 def first(lst, default=''):
     return lst[0] if lst else default
 
-def thin_border():
-    """Immer neue Instanz erstellen – niemals dasselbe Objekt an mehrere Zellen weitergeben."""
-    s = Side(style='thin', color='BFBFBF')
-    return Border(left=s, right=s, top=s, bottom=s)
-
-def styled_cell(cell, bg, bold=False, center=False):
-    """Wendet Stil auf eine Zelle an – erzeugt dabei immer neue Style-Objekte."""
-    cell.font      = Font(name='Arial', size=11 if bold else 10, bold=bold,
-                          color='FFFFFF' if bold else '000000')
-    cell.fill      = PatternFill('solid', start_color=bg)
-    cell.alignment = Alignment(horizontal='center' if (bold or center) else 'left',
-                               vertical='center', wrap_text=bold)
-    cell.border    = thin_border()
-
 def days_to_weeks(days):
     return round(days / 7)
 
@@ -107,7 +79,6 @@ def gh_headers():
     return {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
 
 def gh_get_file(path):
-    """Gibt (content_bytes, sha) zurück oder (None, None) wenn nicht vorhanden."""
     resp = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}",
                         headers=gh_headers(), timeout=15)
     if resp.status_code == 404:
@@ -166,59 +137,57 @@ def fetch_algolia(api_key):
     return unique
 
 # ── Zeilen extrahieren ────────────────────────────────────────────────────────
+def make_trip_row(h, y, i, proposals):
+    dest      = h.get('trip_destination', {}) or {}
+    start_ts  = h.get('start_date_min') or first(h.get('start_date', []))
+    end_ts    = first(h.get('end_date', []))
+    sk        = (y.get('skipper') or {})
+    sk_status = sk.get('status', '')
+    sk_name   = sk.get('name', '')
+    ys        = y.get('status', '')
+    if ys == 'should_be_canceled':  color = 'cancel'
+    elif not sk_name:               color = 'no_skipper'
+    elif sk_status == 'assigned':   color = 'unconfirmed'
+    else:                           color = None
+    return {
+        'Startdatum':      ts_to_date(start_ts),
+        'Enddatum':        ts_to_date(end_ts),
+        '_start_iso':      ts_to_iso(start_ts),
+        '_end_iso':        ts_to_iso(end_ts),
+        '_yacht_key':      f"{h.get('trip_date_id')}_{y.get('id')}",
+        '_color':          color,
+        'Reisename':       dest.get('name', ''),
+        'Typ':             h.get('type', ''),
+        'Tage':            first(h.get('trip_days', [])),
+        'Altersgruppe':    first(h.get('age_range', [])),
+        'Saison':          first(h.get('season', [])),
+        'Preisspanne (€)': first(h.get('price_range', [])),
+        'Land':            dest.get('country', ''),
+        'Kontinent':       dest.get('continent', ''),
+        'Anbieter':        h.get('vendor', ''),
+        'Trip ID':         str(h.get('trip_id', '')),
+        'Trip Date ID':    str(h.get('trip_date_id', '')),
+        'Skipper':         sk_name if sk_name else '⚠ Kein Skipper',
+        'ID Skipper':      str(sk.get('id', '')),
+        'Plätze gesamt':   y.get('places', ''),
+        'Plätze belegt':   y.get('occupied_places', ''),
+        'Yacht ID':        str(y.get('id', '')),
+        'Yachtmodell':     y.get('accomodation_details_name', ''),
+        'Yachtname':       y.get('yacht_name', ''),
+        'Bootstyp':        y.get('accomodation_details_type', ''),
+        'Baujahr':         y.get('yacht_year', ''),
+        'Yacht Status':    'Zu stornieren' if ys == 'should_be_canceled' else 'Bestätigt',
+        'Skipper Status':  SKIPPER_STATUS_LABELS.get(sk_status, sk_status or '—'),
+        'Flotillenführer': 'Ja' if sk.get('is_flotilla_leader') else 'Nein',
+        'Bewerbungen':     ', '.join(proposals) if i == 0 else '',
+    }
+
 def extract_rows(hits):
     rows = []
     for h in hits:
-        dest      = h.get('trip_destination', {}) or {}
         proposals = [p['name'] for p in h.get('yacht_skipper_proposals', []) if p.get('name')]
-        start_ts  = h.get('start_date_min') or first(h.get('start_date', []))
-        end_ts    = first(h.get('end_date', []))
-        trip_info = {
-            'Startdatum':      ts_to_date(start_ts),
-            'Enddatum':        ts_to_date(end_ts),
-            '_start_iso':      ts_to_iso(start_ts),
-            '_end_iso':        ts_to_iso(end_ts),
-            'Reisename':       dest.get('name', ''),
-            'Typ':             h.get('type', ''),
-            'Tage':            first(h.get('trip_days', [])),
-            'Altersgruppe':    first(h.get('age_range', [])),
-            'Saison':          first(h.get('season', [])),
-            'Preisspanne (€)': first(h.get('price_range', [])),
-            'Land':            dest.get('country', ''),
-            'Kontinent':       dest.get('continent', ''),
-            'Anbieter':        h.get('vendor', ''),
-            'Trip ID':         h.get('trip_id', ''),
-            'Trip Date ID':    h.get('trip_date_id', ''),
-        }
         for i, y in enumerate(h.get('yachts', [])):
-            sk            = (y.get('skipper') or {})
-            sk_status_raw = sk.get('status', '')
-            sk_name       = sk.get('name', '')
-            yacht_status  = y.get('status', '')
-            if yacht_status == 'should_be_canceled': row_color = COL_CANCEL
-            elif not sk_name:                         row_color = COL_NO_SKIPPER
-            elif sk_status_raw == 'assigned':         row_color = COL_UNCONFIRMED
-            else:                                     row_color = None
-            row = dict(trip_info)
-            row.update({
-                'Skipper':         sk_name if sk_name else '⚠ Kein Skipper',
-                'ID Skipper':      sk.get('id', ''),
-                'Plätze gesamt':   y.get('places', ''),
-                'Plätze belegt':   y.get('occupied_places', ''),
-                'Yacht ID':        y.get('id', ''),
-                'Yachtmodell':     y.get('accomodation_details_name', ''),
-                'Yachtname':       y.get('yacht_name', ''),
-                'Bootstyp':        y.get('accomodation_details_type', ''),
-                'Baujahr':         y.get('yacht_year', ''),
-                'Yacht Status':    'Zu stornieren' if yacht_status == 'should_be_canceled' else 'Bestätigt',
-                'Skipper Status':  SKIPPER_STATUS_LABELS.get(sk_status_raw, sk_status_raw or '—'),
-                'Flotillenführer': 'Ja' if sk.get('is_flotilla_leader') else 'Nein',
-                'Bewerbungen':     ', '.join(proposals) if i == 0 else '',
-                '_color':          row_color,
-                '_yacht_key':      f"{h.get('trip_date_id')}_{y.get('id')}",
-                '_proposals':      proposals if i == 0 else [],
-            })
-            rows.append(row)
+            rows.append(make_trip_row(h, y, i, proposals))
     return rows
 
 def build_skipper_data(hits):
@@ -239,10 +208,6 @@ def build_skipper_data(hits):
 
 # ── Changelog ────────────────────────────────────────────────────────────────
 def detect_changes(new_hits, prev_hits, today):
-    """Vergleicht neue mit vorherigen Hits und gibt Änderungen zurück."""
-    changes = []
-
-    # Index aufbauen: yacht_key → Daten
     def index_hits(hits):
         idx = {}
         for h in hits:
@@ -254,334 +219,239 @@ def detect_changes(new_hits, prev_hits, today):
                 key = f"{h.get('trip_date_id')}_{y.get('id')}"
                 sk  = y.get('skipper') or {}
                 idx[key] = {
-                    'trip_date_id':  h.get('trip_date_id'),
-                    'yacht_id':      y.get('id'),
-                    'reisename':     dest.get('name', ''),
-                    'startdatum':    ts_to_date(start_ts),
-                    'start_iso':     ts_to_iso(start_ts),
-                    'enddatum':      ts_to_date(end_ts),
-                    'end_iso':       ts_to_iso(end_ts),
-                    'yachtmodell':   y.get('accomodation_details_name', ''),
-                    'yachtname':     y.get('yacht_name', ''),
-                    'skipper_name':  sk.get('name', ''),
-                    'skipper_id':    sk.get('id', ''),
-                    'yacht_status':  y.get('status', ''),
-                    'proposals':     proposals,
+                    'typ': '', 'reisename': dest.get('name', ''),
+                    'startdatum': ts_to_date(start_ts), 'start_iso': ts_to_iso(start_ts),
+                    'enddatum': ts_to_date(end_ts), 'end_iso': ts_to_iso(end_ts),
+                    'yachtmodell': y.get('accomodation_details_name', ''),
+                    'yachtname': y.get('yacht_name', ''),
+                    'skipper_name': sk.get('name', ''), 'skipper_id': sk.get('id', ''),
+                    'yacht_status': y.get('status', ''), 'proposals': proposals,
+                    'skipper_alt': '', 'neue_bewerbungen': '',
                 }
         return idx
 
     new_idx  = index_hits(new_hits)
     prev_idx = index_hits(prev_hits)
+    changes  = []
 
-    # Neue Boote
     for key, nd in new_idx.items():
         if key not in prev_idx:
-            changes.append({
-                'typ': 'Neues Boot',
-                **nd,
-                'skipper_alt': '',
-            })
+            entry = dict(nd); entry['typ'] = 'Neues Boot'
+            changes.append(entry)
 
-    # Storniert oder geändert
     for key, pd in prev_idx.items():
         if key not in new_idx:
             if pd['start_iso'] > today:
-                # Startdatum in Zukunft → storniert
-                changes.append({'typ': 'Storniert', **pd, 'skipper_alt': pd['skipper_name']})
-            # Wenn start_iso <= today → Boot ist losgefahren, kein Changelog-Eintrag
+                entry = dict(pd); entry['typ'] = 'Storniert'; entry['skipper_alt'] = pd['skipper_name']
+                changes.append(entry)
         else:
             nd = new_idx[key]
-            row_changes = {}
-
-            # Skipper geändert
+            entry = dict(nd)
+            changed = False
             if pd['skipper_name'] != nd['skipper_name']:
-                row_changes['skipper_alt'] = pd['skipper_name'] or '(Kein Skipper)'
-                row_changes['typ'] = 'Skipper geändert'
-
-            # Neue Bewerbungen
+                entry['typ'] = 'Skipper geändert'
+                entry['skipper_alt'] = pd['skipper_name'] or '(Kein Skipper)'
+                changed = True
             new_proposals = [p for p in nd['proposals'] if p not in pd['proposals']]
             if new_proposals:
-                row_changes['neue_bewerbungen'] = ', '.join(new_proposals)
-                if 'typ' not in row_changes:
-                    row_changes['typ'] = 'Neue Bewerbung(en)'
-
-            if row_changes:
-                changes.append({**nd, **row_changes,
-                                 'skipper_alt': row_changes.get('skipper_alt', '')})
+                entry['neue_bewerbungen'] = ', '.join(new_proposals)
+                if not changed: entry['typ'] = 'Neue Bewerbung(en)'
+                changed = True
+            if changed:
+                changes.append(entry)
 
     return changes
 
-# ── Fahrstatus aktualisieren ──────────────────────────────────────────────────
+# ── Fahrstatus ────────────────────────────────────────────────────────────────
 def update_sailing_status(history, new_hits, prev_hits, today):
-    """Aktualisiert currently_sailing und past_trips."""
-    new_idx  = {f"{h.get('trip_date_id')}_{y.get('id')}": True
-                for h in new_hits for y in h.get('yachts', [])}
-
-    # Aus prev_hits: Boote die verschwunden sind und heute fahren → currently_sailing
+    new_idx = {f"{h.get('trip_date_id')}_{y.get('id')}": True
+               for h in new_hits for y in h.get('yachts', [])}
     existing_keys = {r['_yacht_key'] for r in history.get('currently_sailing', [])}
+
     for h in prev_hits:
-        dest     = h.get('trip_destination', {}) or {}
-        start_ts = h.get('start_date_min') or first(h.get('start_date', []))
-        end_ts   = first(h.get('end_date', []))
-        start_iso = ts_to_iso(start_ts)
-        end_iso   = ts_to_iso(end_ts)
         proposals = [p['name'] for p in h.get('yacht_skipper_proposals', []) if p.get('name')]
         for i, y in enumerate(h.get('yachts', [])):
             key = f"{h.get('trip_date_id')}_{y.get('id')}"
             if key not in new_idx and key not in existing_keys:
+                row = make_trip_row(h, y, i, proposals)
+                start_iso = row.get('_start_iso', '')
+                end_iso   = row.get('_end_iso', '')
                 if start_iso and start_iso <= today and end_iso >= today:
-                    sk = y.get('skipper') or {}
-                    row = {
-                        'Startdatum':      ts_to_date(start_ts),
-                        'Enddatum':        ts_to_date(end_ts),
-                        '_start_iso':      start_iso,
-                        '_end_iso':        end_iso,
-                        '_yacht_key':      key,
-                        'Reisename':       dest.get('name', ''),
-                        'Typ':             h.get('type', ''),
-                        'Tage':            first(h.get('trip_days', [])),
-                        'Altersgruppe':    first(h.get('age_range', [])),
-                        'Saison':          first(h.get('season', [])),
-                        'Preisspanne (€)': first(h.get('price_range', [])),
-                        'Land':            dest.get('country', ''),
-                        'Kontinent':       dest.get('continent', ''),
-                        'Anbieter':        h.get('vendor', ''),
-                        'Trip ID':         h.get('trip_id', ''),
-                        'Trip Date ID':    h.get('trip_date_id', ''),
-                        'Skipper':         sk.get('name', '') or '—',
-                        'ID Skipper':      sk.get('id', ''),
-                        'Plätze gesamt':   y.get('places', ''),
-                        'Plätze belegt':   y.get('occupied_places', ''),
-                        'Yacht ID':        y.get('id', ''),
-                        'Yachtmodell':     y.get('accomodation_details_name', ''),
-                        'Yachtname':       y.get('yacht_name', ''),
-                        'Bootstyp':        y.get('accomodation_details_type', ''),
-                        'Baujahr':         y.get('yacht_year', ''),
-                        'Yacht Status':    'Bestätigt',
-                        'Skipper Status':  SKIPPER_STATUS_LABELS.get(sk.get('status',''), sk.get('status','') or '—'),
-                        'Flotillenführer': 'Ja' if sk.get('is_flotilla_leader') else 'Nein',
-                        'Bewerbungen':     ', '.join(proposals) if i == 0 else '',
-                    }
                     history['currently_sailing'].append(row)
 
-    # currently_sailing → past_trips wenn Enddatum überschritten
-    still_sailing, ended = [], []
-    cutoff_delete = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(weeks=4)).strftime('%Y-%m-%d')
+    cutoff = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(weeks=4)).strftime('%Y-%m-%d')
+    still, ended = [], []
     for row in history.get('currently_sailing', []):
-        end_iso = row.get('_end_iso', '')
-        if end_iso and end_iso < today:
-            ended.append(row)
-        else:
-            still_sailing.append(row)
+        (ended if row.get('_end_iso','') < today else still).append(row)
+    history['currently_sailing'] = still
 
-    history['currently_sailing'] = still_sailing
-
-    # Vergangene hinzufügen (Duplikate vermeiden)
     past_keys = {r['_yacht_key'] for r in history.get('past_trips', [])}
     for row in ended:
         if row['_yacht_key'] not in past_keys:
             history['past_trips'].append(row)
-
-    # Vergangene löschen wenn > 4 Wochen her
     history['past_trips'] = [r for r in history.get('past_trips', [])
-                              if r.get('_end_iso', '') >= cutoff_delete]
-
+                              if r.get('_end_iso','') >= cutoff]
     return history
 
-# ── Excel bauen ───────────────────────────────────────────────────────────────
-def apply_header(ws, cols, widths=None):
-    ws.row_dimensions[1].height = 32
-    for c, col in enumerate(cols, 1):
-        cell = ws.cell(1, c, col)
-        styled_cell(cell, COL_HEADER, bold=True)
-        if widths:
-            ws.column_dimensions[get_column_letter(c)].width = widths.get(col, 14)
-
-def data_cell(cell, bg, bold=False):
-    styled_cell(cell, bg, bold=bold)
-
-def add_data_sheet(wb, title, rows, freeze=True):
-    ws = wb.create_sheet(title)
-    apply_header(ws, COLUMN_ORDER, COL_WIDTHS)
-    fill_a = PatternFill('solid', start_color=COL_ROW_A)
-    fill_b = PatternFill('solid', start_color=COL_ROW_B)
-    for r, row in enumerate(rows, 2):
-        override = row.get('_color')
-        rf = PatternFill('solid', start_color=override) if override else (fill_a if r%2==0 else fill_b)
-        for c, col in enumerate(COLUMN_ORDER, 1):
-            cell = ws.cell(r, c, row.get(col, ''))
-            data_cell(cell, override or (COL_ROW_A if r%2==0 else COL_ROW_B))
-    if freeze:
-        ws.freeze_panes = 'A2'
-        ws.auto_filter.ref = f"A1:{get_column_letter(len(COLUMN_ORDER))}1"
-    return ws
-
+# ── Excel bauen (xlsxwriter) ──────────────────────────────────────────────────
 def build_excel(rows, skipper_data, changelog=None, currently_sailing=None, past_trips=None):
-    wb = Workbook()
+    buf = io.BytesIO()
+    wb  = xlsxwriter.Workbook(buf, {'in_memory': True})
 
-    # ── Segelreisen ────────────────────────────────────────────────────────────
-    ws = wb.active
-    ws.title = "Segelreisen"
-    apply_header(ws, COLUMN_ORDER, COL_WIDTHS)
-    for r, row in enumerate(rows, 2):
-        override = row.get('_color')
-        bg = override or (COL_ROW_A if r%2==0 else COL_ROW_B)
-        for c, col in enumerate(COLUMN_ORDER, 1):
-            cell = ws.cell(r, c, row.get(col, ''))
-            styled_cell(cell, bg)
-    ws.freeze_panes = 'A2'
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(COLUMN_ORDER))}1"
-    # Legende
-    lc = len(COLUMN_ORDER) + 2
-    ws.cell(1, lc, 'Legende').font = Font(name='Arial', bold=True, size=11)
-    for i, (color, label) in enumerate([(COL_NO_SKIPPER,'⚠ Kein Skipper'),(COL_CANCEL,'🚫 Zu stornieren'),(COL_UNCONFIRMED,'⏳ Nicht bestätigt')], 2):
-        cell = ws.cell(i, lc, label)
-        cell.fill   = PatternFill('solid', start_color=color)
-        cell.font   = Font(name='Arial', size=10)
-        cell.border = thin_border()
-    ws.column_dimensions[get_column_letter(lc)].width = 26
+    # Formate definieren
+    def fmt(bg='FFFFFF', bold=False, center=False, font_color='000000'):
+        return wb.add_format({
+            'font_name':  'Arial',
+            'font_size':  11 if bold else 10,
+            'bold':       bold,
+            'font_color': font_color,
+            'bg_color':   f'#{bg}',
+            'align':      'center' if center else 'left',
+            'valign':     'vcenter',
+            'border':     1,
+            'border_color': '#BFBFBF',
+            'text_wrap':  bold,
+        })
 
-    # ── Aktuell fahrende Boote ─────────────────────────────────────────────────
-    ws_sail = wb.create_sheet("Aktuell fahrend")
-    apply_header(ws_sail, COLUMN_ORDER, COL_WIDTHS)
-    for r, row in enumerate(sorted(currently_sailing or [], key=lambda x: x.get('_start_iso','')), 2):
-        bg = COL_ROW_A if r%2==0 else COL_ROW_B
-        for c, col in enumerate(COLUMN_ORDER, 1):
-            styled_cell(ws_sail.cell(r, c, row.get(col, '')), bg)
-    ws_sail.freeze_panes = 'A2'
-    ws_sail.auto_filter.ref = f"A1:{get_column_letter(len(COLUMN_ORDER))}1"
+    hdr      = fmt('1F4E79', bold=True, center=True, font_color='FFFFFF')
+    row_a    = fmt('D6E4F0')
+    row_b    = fmt('FFFFFF')
+    no_skip  = fmt('B4F7B4')
+    cancel   = fmt('FFCCCC')
+    unconf   = fmt('FCE4D6')
+    stamm_f  = fmt('C6EFCE')
+    adv_f    = fmt('FFEB9C')
+    hobby_f  = fmt('FFFFFF')
+    cl_chg   = fmt('FFF2CC')
+    cl_new   = fmt('E2EFDA')
+    cl_can   = fmt('FCE4D6')
+    cl_bew   = fmt('D6E4F0')
+    center_a = fmt('D6E4F0', center=True)
+    center_b = fmt('FFFFFF', center=True)
 
-    # ── Vergangene Törns ───────────────────────────────────────────────────────
-    ws_past = wb.create_sheet("Vergangene Törns")
-    apply_header(ws_past, COLUMN_ORDER, COL_WIDTHS)
-    for r, row in enumerate(sorted(past_trips or [], key=lambda x: x.get('_end_iso',''), reverse=True), 2):
-        bg = COL_ROW_A if r%2==0 else COL_ROW_B
-        for c, col in enumerate(COLUMN_ORDER, 1):
-            styled_cell(ws_past.cell(r, c, row.get(col, '')), bg)
-    ws_past.freeze_panes = 'A2'
-    ws_past.auto_filter.ref = f"A1:{get_column_letter(len(COLUMN_ORDER))}1"
+    color_fmt = {'cancel': cancel, 'no_skipper': no_skip, 'unconfirmed': unconf}
 
-    # ── Changelog ──────────────────────────────────────────────────────────────
+    def write_trip_sheet(ws_name, trip_rows, sort_key=None, reverse=False):
+        ws = wb.add_worksheet(ws_name)
+        ws.freeze_panes(1, 0)
+        ws.autofilter(0, 0, 0, len(COLUMN_ORDER)-1)
+        for c, col in enumerate(COLUMN_ORDER):
+            ws.set_column(c, c, COL_WIDTHS.get(col, 14))
+            ws.write(0, c, col, hdr)
+        ws.set_row(0, 32)
+
+        data = sorted(trip_rows, key=lambda x: x.get(sort_key,''), reverse=reverse) if sort_key else trip_rows
+        for r, row in enumerate(data, 1):
+            cf = color_fmt.get(row.get('_color')) or (row_a if r%2==1 else row_b)
+            for c, col in enumerate(COLUMN_ORDER):
+                ws.write(r, c, row.get(col, ''), cf)
+        return ws
+
+    # Segelreisen
+    ws_main = write_trip_sheet('Segelreisen', rows)
+    lc = len(COLUMN_ORDER) + 1
+    ws_main.write(0, lc, 'Legende', fmt('FFFFFF', bold=True))
+    ws_main.set_column(lc, lc, 26)
+    for i, (bg, label) in enumerate([(no_skip,'⚠ Kein Skipper'),(cancel,'🚫 Zu stornieren'),(unconf,'⏳ Nicht bestätigt')], 1):
+        ws_main.write(i, lc, label, bg)
+
+    # Aktuell fahrend
+    write_trip_sheet('Aktuell fahrend', currently_sailing or [], sort_key='_start_iso')
+
+    # Vergangene Törns
+    write_trip_sheet('Vergangene Törns', past_trips or [], sort_key='_end_iso', reverse=True)
+
+    # Changelog
     if changelog is not None:
-        ws_cl = wb.create_sheet("Changelog")
+        ws_cl = wb.add_worksheet('Changelog')
         cl_cols = ['Typ','Reisename','Startdatum','Enddatum','Yachtmodell','Yachtname',
                    'Skipper (neu)','Skipper (alt)','Neue Bewerbungen']
-        cl_widths = {'Typ':18,'Reisename':28,'Startdatum':12,'Enddatum':12,
-                     'Yachtmodell':22,'Yachtname':18,'Skipper (neu)':20,
-                     'Skipper (alt)':20,'Neue Bewerbungen':40}
-        apply_header(ws_cl, cl_cols, cl_widths)
-        color_map = {'Skipper geändert': COL_CHANGE, 'Neues Boot': COL_NEW,
-                     'Storniert': COL_CANCEL_LOG, 'Neue Bewerbung(en)': COL_ROW_A}
-        for r, ch in enumerate(changelog, 2):
-            bg = color_map.get(ch.get('typ',''), COL_ROW_B)
+        cl_widths = [18,28,12,12,22,18,20,20,40]
+        ws_cl.freeze_panes(1, 0)
+        ws_cl.autofilter(0, 0, 0, len(cl_cols)-1)
+        for c, (col, w) in enumerate(zip(cl_cols, cl_widths)):
+            ws_cl.set_column(c, c, w)
+            ws_cl.write(0, c, col, hdr)
+        ws_cl.set_row(0, 32)
+        type_fmt = {'Skipper geändert': cl_chg, 'Neues Boot': cl_new,
+                    'Storniert': cl_can, 'Neue Bewerbung(en)': cl_bew}
+        for r, ch in enumerate(changelog, 1):
+            cf = type_fmt.get(ch.get('typ',''), row_b)
             vals = [ch.get('typ',''), ch.get('reisename',''), ch.get('startdatum',''),
                     ch.get('enddatum',''), ch.get('yachtmodell',''), ch.get('yachtname',''),
                     ch.get('skipper_name',''), ch.get('skipper_alt',''), ch.get('neue_bewerbungen','')]
-            for c, val in enumerate(vals, 1):
-                styled_cell(ws_cl.cell(r, c, val), bg)
-        ws_cl.freeze_panes = 'A2'
-        ws_cl.auto_filter.ref = f"A1:{get_column_letter(len(cl_cols))}1"
+            for c, val in enumerate(vals):
+                ws_cl.write(r, c, val, cf)
 
-    # ── Skipper ────────────────────────────────────────────────────────────────
-    ws2 = wb.create_sheet("Skipper")
-    sk_cols = ['Skipper','ID','Törns','Wochen','Status']
-    sk_widths = {'Skipper':24,'ID':10,'Törns':8,'Wochen':9,'Status':16}
-    apply_header(ws2, sk_cols, sk_widths)
-    status_colors = {'Stammskipper': COL_STAMM, 'Advanced': COL_ADVANCED, 'Hobby': COL_ROW_B}
-    for r, (sid, d) in enumerate(skipper_data, 2):
-        status = 'Stammskipper' if sid in STAMMSKIPPER else ('Advanced' if d['summer_weeks'] > 5 else 'Hobby')
-        vals   = [d['name'], sid, d['törns'], d['total_weeks'], status]
-        default_bg = COL_ROW_A if r%2==0 else COL_ROW_B
-        for c, val in enumerate(vals, 1):
-            bg = status_colors[status] if c==5 else default_bg
-            cell = ws2.cell(r, c, val)
-            styled_cell(cell, bg, center=(c in (2,3,4)))
-    ws2.freeze_panes = 'A2'
-    ws2.auto_filter.ref = 'A1:E1'
+    # Skipper
+    ws_sk = wb.add_worksheet('Skipper')
+    sk_cols   = ['Skipper','ID','Törns','Wochen','Status']
+    sk_widths = [24,10,8,9,16]
+    ws_sk.freeze_panes(1, 0)
+    ws_sk.autofilter(0, 0, 0, 4)
+    for c, (col, w) in enumerate(zip(sk_cols, sk_widths)):
+        ws_sk.set_column(c, c, w)
+        ws_sk.write(0, c, col, hdr)
+    ws_sk.set_row(0, 32)
+    status_fmt = {'Stammskipper': stamm_f, 'Advanced': adv_f, 'Hobby': hobby_f}
+    for r, (sid, d) in enumerate(skipper_data, 1):
+        status  = 'Stammskipper' if sid in STAMMSKIPPER else ('Advanced' if d['summer_weeks'] > 5 else 'Hobby')
+        def_fmt = row_a if r%2==1 else row_b
+        def_ctr = center_a if r%2==1 else center_b
+        sf      = status_fmt[status]
+        ws_sk.write(r, 0, d['name'],        def_fmt)
+        ws_sk.write(r, 1, sid,              def_ctr)
+        ws_sk.write(r, 2, d['törns'],       def_ctr)
+        ws_sk.write(r, 3, d['total_weeks'], def_ctr)
+        ws_sk.write(r, 4, status,           sf)
 
-    buf = io.BytesIO()
-    wb.save(buf)
+    wb.close()
     buf.seek(0)
     return buf
 
 # ── Endpunkte ─────────────────────────────────────────────────────────────────
 def check_password():
-    provided = request.args.get("password", "")
-    if APP_PASSWORD and provided != APP_PASSWORD:
-        return False
-    return True
+    return not APP_PASSWORD or request.args.get("password","") == APP_PASSWORD
 
 @app.route("/check", methods=["GET"])
 def check():
-    if not check_password():
-        return jsonify({"ok": False}), 401
-    return jsonify({"ok": True})
+    return (jsonify({"ok": True}) if check_password() else (jsonify({"ok": False}), 401))
 
 @app.route("/refresh", methods=["GET"])
 def refresh():
-    """Daten laden, Excel erstellen, ins GitHub-Repo committen."""
-    source = request.args.get("source", "manual")  # "daily" oder "manual"
+    source  = request.args.get("source", "manual")
     try:
-        now_str  = datetime.datetime.now(datetime.UTC).strftime('%d.%m.%Y %H:%M UTC')
-        today    = today_iso()
-
-        # Daten holen
+        now_str = datetime.datetime.now(datetime.UTC).strftime('%d.%m.%Y %H:%M UTC')
+        today   = today_iso()
         api_key  = login()
         new_hits = fetch_algolia(api_key)
-
-        # History laden
         history  = load_history()
         prev_hits = history.get("daily_hits", [])
-
-        # Changelog (nur wenn vorherige Daten vorhanden)
         changelog = detect_changes(new_hits, prev_hits, today) if prev_hits else []
-
-        # Fahrstatus aktualisieren
-        history = update_sailing_status(history, new_hits, prev_hits, today)
-
-        # Bei täglichem Lauf: daily_hits aktualisieren
+        history   = update_sailing_status(history, new_hits, prev_hits, today)
         if source == "daily":
             history["daily_hits"] = new_hits
-
-        # Excel bauen
         rows         = extract_rows(new_hits)
         skipper_data = build_skipper_data(new_hits)
         buf          = build_excel(rows, skipper_data, changelog,
                                    history['currently_sailing'], history['past_trips'])
         excel_bytes  = buf.read()
-
-        # History speichern
-        save_history(history, f"History aktualisiert: {now_str}")
-
-        # skipperplan.xlsx speichern (immer)
+        save_history(history, f"History: {now_str}")
         _, sha_main = gh_get_file("skipperplan.xlsx")
-        gh_put_file("skipperplan.xlsx", excel_bytes, sha_main,
-                    f"Skipperplan aktualisiert: {now_str}")
-
-        # skipperplan_daily.xlsx nur beim täglichen Lauf speichern
+        gh_put_file("skipperplan.xlsx", excel_bytes, sha_main, f"Skipperplan: {now_str}")
         if source == "daily":
             _, sha_daily = gh_get_file("skipperplan_daily.xlsx")
-            gh_put_file("skipperplan_daily.xlsx", excel_bytes, sha_daily,
-                        f"Skipperplan täglich: {now_str}")
-
-        return jsonify({
-            "ok":       True,
-            "updated":  now_str,
-            "termine":  len(new_hits),
-            "yachten":  len(rows),
-            "changes":  len(changelog),
-            "sailing":  len(history['currently_sailing']),
-        })
-
+            gh_put_file("skipperplan_daily.xlsx", excel_bytes, sha_daily, f"Täglich: {now_str}")
+        return jsonify({"ok": True, "updated": now_str,
+                        "termine": len(new_hits), "yachten": len(rows),
+                        "changes": len(changelog), "sailing": len(history['currently_sailing'])})
     except Exception as e:
         import traceback
-        return jsonify({"error": str(e), "trace": traceback.format_exc()[-500:]}), 500
-
+        return jsonify({"error": str(e), "trace": traceback.format_exc()[-800:]}), 500
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
