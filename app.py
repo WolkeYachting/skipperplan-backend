@@ -79,8 +79,18 @@ def first(lst, default=''):
     return lst[0] if lst else default
 
 def thin_border():
+    """Immer neue Instanz erstellen – niemals dasselbe Objekt an mehrere Zellen weitergeben."""
     s = Side(style='thin', color='BFBFBF')
     return Border(left=s, right=s, top=s, bottom=s)
+
+def styled_cell(cell, bg, bold=False, center=False):
+    """Wendet Stil auf eine Zelle an – erzeugt dabei immer neue Style-Objekte."""
+    cell.font      = Font(name='Arial', size=11 if bold else 10, bold=bold,
+                          color='FFFFFF' if bold else '000000')
+    cell.fill      = PatternFill('solid', start_color=bg)
+    cell.alignment = Alignment(horizontal='center' if (bold or center) else 'left',
+                               vertical='center', wrap_text=bold)
+    cell.border    = thin_border()
 
 def days_to_weeks(days):
     return round(days / 7)
@@ -380,22 +390,15 @@ def update_sailing_status(history, new_hits, prev_hits, today):
 
 # ── Excel bauen ───────────────────────────────────────────────────────────────
 def apply_header(ws, cols, widths=None):
-    border = thin_border()
     ws.row_dimensions[1].height = 32
     for c, col in enumerate(cols, 1):
         cell = ws.cell(1, c, col)
-        cell.font      = Font(name='Arial', bold=True, color='FFFFFF', size=11)
-        cell.fill      = PatternFill('solid', start_color=COL_HEADER)
-        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-        cell.border    = border
+        styled_cell(cell, COL_HEADER, bold=True)
         if widths:
             ws.column_dimensions[get_column_letter(c)].width = widths.get(col, 14)
 
 def data_cell(cell, bg, bold=False):
-    cell.font      = Font(name='Arial', size=10, bold=bold)
-    cell.fill      = PatternFill('solid', start_color=bg)
-    cell.alignment = Alignment(horizontal='left', vertical='center')
-    cell.border    = thin_border()
+    styled_cell(cell, bg, bold=bold)
 
 def add_data_sheet(wb, title, rows, freeze=True):
     ws = wb.create_sheet(title)
@@ -415,22 +418,17 @@ def add_data_sheet(wb, title, rows, freeze=True):
 
 def build_excel(rows, skipper_data, changelog=None, currently_sailing=None, past_trips=None):
     wb = Workbook()
-    border = thin_border()
 
     # ── Segelreisen ────────────────────────────────────────────────────────────
     ws = wb.active
     ws.title = "Segelreisen"
     apply_header(ws, COLUMN_ORDER, COL_WIDTHS)
-    fill_a = PatternFill('solid', start_color=COL_ROW_A)
-    fill_b = PatternFill('solid', start_color=COL_ROW_B)
     for r, row in enumerate(rows, 2):
         override = row.get('_color')
+        bg = override or (COL_ROW_A if r%2==0 else COL_ROW_B)
         for c, col in enumerate(COLUMN_ORDER, 1):
             cell = ws.cell(r, c, row.get(col, ''))
-            cell.font      = Font(name='Arial', size=10)
-            cell.fill      = PatternFill('solid', start_color=override) if override else (fill_a if r%2==0 else fill_b)
-            cell.alignment = Alignment(horizontal='left', vertical='center')
-            cell.border    = border
+            styled_cell(cell, bg)
     ws.freeze_panes = 'A2'
     ws.auto_filter.ref = f"A1:{get_column_letter(len(COLUMN_ORDER))}1"
     # Legende
@@ -438,21 +436,18 @@ def build_excel(rows, skipper_data, changelog=None, currently_sailing=None, past
     ws.cell(1, lc, 'Legende').font = Font(name='Arial', bold=True, size=11)
     for i, (color, label) in enumerate([(COL_NO_SKIPPER,'⚠ Kein Skipper'),(COL_CANCEL,'🚫 Zu stornieren'),(COL_UNCONFIRMED,'⏳ Nicht bestätigt')], 2):
         cell = ws.cell(i, lc, label)
-        cell.fill = PatternFill('solid', start_color=color)
-        cell.font = Font(name='Arial', size=10)
-        cell.border = border
+        cell.fill   = PatternFill('solid', start_color=color)
+        cell.font   = Font(name='Arial', size=10)
+        cell.border = thin_border()
     ws.column_dimensions[get_column_letter(lc)].width = 26
 
     # ── Aktuell fahrende Boote ─────────────────────────────────────────────────
     ws_sail = wb.create_sheet("Aktuell fahrend")
     apply_header(ws_sail, COLUMN_ORDER, COL_WIDTHS)
     for r, row in enumerate(sorted(currently_sailing or [], key=lambda x: x.get('_start_iso','')), 2):
+        bg = COL_ROW_A if r%2==0 else COL_ROW_B
         for c, col in enumerate(COLUMN_ORDER, 1):
-            cell = ws_sail.cell(r, c, row.get(col, ''))
-            cell.font      = Font(name='Arial', size=10)
-            cell.fill      = fill_a if r%2==0 else fill_b
-            cell.alignment = Alignment(horizontal='left', vertical='center')
-            cell.border    = border
+            styled_cell(ws_sail.cell(r, c, row.get(col, '')), bg)
     ws_sail.freeze_panes = 'A2'
     ws_sail.auto_filter.ref = f"A1:{get_column_letter(len(COLUMN_ORDER))}1"
 
@@ -460,12 +455,9 @@ def build_excel(rows, skipper_data, changelog=None, currently_sailing=None, past
     ws_past = wb.create_sheet("Vergangene Törns")
     apply_header(ws_past, COLUMN_ORDER, COL_WIDTHS)
     for r, row in enumerate(sorted(past_trips or [], key=lambda x: x.get('_end_iso',''), reverse=True), 2):
+        bg = COL_ROW_A if r%2==0 else COL_ROW_B
         for c, col in enumerate(COLUMN_ORDER, 1):
-            cell = ws_past.cell(r, c, row.get(col, ''))
-            cell.font      = Font(name='Arial', size=10)
-            cell.fill      = fill_a if r%2==0 else fill_b
-            cell.alignment = Alignment(horizontal='left', vertical='center')
-            cell.border    = border
+            styled_cell(ws_past.cell(r, c, row.get(col, '')), bg)
     ws_past.freeze_panes = 'A2'
     ws_past.auto_filter.ref = f"A1:{get_column_letter(len(COLUMN_ORDER))}1"
 
@@ -482,23 +474,11 @@ def build_excel(rows, skipper_data, changelog=None, currently_sailing=None, past
                      'Storniert': COL_CANCEL_LOG, 'Neue Bewerbung(en)': COL_ROW_A}
         for r, ch in enumerate(changelog, 2):
             bg = color_map.get(ch.get('typ',''), COL_ROW_B)
-            vals = [
-                ch.get('typ',''),
-                ch.get('reisename',''),
-                ch.get('startdatum',''),
-                ch.get('enddatum',''),
-                ch.get('yachtmodell',''),
-                ch.get('yachtname',''),
-                ch.get('skipper_name',''),
-                ch.get('skipper_alt',''),
-                ch.get('neue_bewerbungen',''),
-            ]
+            vals = [ch.get('typ',''), ch.get('reisename',''), ch.get('startdatum',''),
+                    ch.get('enddatum',''), ch.get('yachtmodell',''), ch.get('yachtname',''),
+                    ch.get('skipper_name',''), ch.get('skipper_alt',''), ch.get('neue_bewerbungen','')]
             for c, val in enumerate(vals, 1):
-                cell = ws_cl.cell(r, c, val)
-                cell.font      = Font(name='Arial', size=10)
-                cell.fill      = PatternFill('solid', start_color=bg)
-                cell.alignment = Alignment(horizontal='left', vertical='center')
-                cell.border    = border
+                styled_cell(ws_cl.cell(r, c, val), bg)
         ws_cl.freeze_panes = 'A2'
         ws_cl.auto_filter.ref = f"A1:{get_column_letter(len(cl_cols))}1"
 
@@ -511,13 +491,11 @@ def build_excel(rows, skipper_data, changelog=None, currently_sailing=None, past
     for r, (sid, d) in enumerate(skipper_data, 2):
         status = 'Stammskipper' if sid in STAMMSKIPPER else ('Advanced' if d['summer_weeks'] > 5 else 'Hobby')
         vals   = [d['name'], sid, d['törns'], d['total_weeks'], status]
-        default_fill = PatternFill('solid', start_color=COL_ROW_A if r%2==0 else COL_ROW_B)
+        default_bg = COL_ROW_A if r%2==0 else COL_ROW_B
         for c, val in enumerate(vals, 1):
+            bg = status_colors[status] if c==5 else default_bg
             cell = ws2.cell(r, c, val)
-            cell.font      = Font(name='Arial', size=10)
-            cell.fill      = PatternFill('solid', start_color=status_colors[status]) if c==5 else default_fill
-            cell.alignment = Alignment(horizontal='center' if c in (2,3,4) else 'left', vertical='center')
-            cell.border    = border
+            styled_cell(cell, bg, center=(c in (2,3,4)))
     ws2.freeze_panes = 'A2'
     ws2.auto_filter.ref = 'A1:E1'
 
