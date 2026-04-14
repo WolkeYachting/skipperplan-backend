@@ -157,6 +157,7 @@ def expand_compact(compact_list):
     return list(hits_by_trip.values())
 
 
+def load_history():
     content, _ = gh_get_file("history.json")
     if content is None:
         return {"daily_hits": [], "currently_sailing": [], "past_trips": []}
