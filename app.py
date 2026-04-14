@@ -159,11 +159,27 @@ def expand_compact(compact_list):
 
 def load_history():
     content, _ = gh_get_file("history.json")
-    if content is None:
-        return {"daily_hits": [], "currently_sailing": [], "past_trips": []}
-    return json.loads(content.decode('utf-8'))
+    if content:
+        try:
+            return json.loads(content.decode('utf-8'))
+        except Exception:
+            pass
+    # Fallback: Backup laden
+    backup, _ = gh_get_file("history_backup.json")
+    if backup:
+        try:
+            print("[load_history] history.json leer/kaputt – lade Backup")
+            return json.loads(backup.decode('utf-8'))
+        except Exception:
+            pass
+    return {"daily_hits": [], "currently_sailing": [], "past_trips": []}
 
 def save_history(history, message="History aktualisiert"):
+    # Erst Backup der aktuellen Version anlegen
+    current, sha_backup = gh_get_file("history_backup.json")
+    if current is not None:
+        gh_put_file("history_backup.json", current, sha_backup, f"Backup: {message}")
+    # Dann neue Version speichern
     _, sha = gh_get_file("history.json")
     gh_put_file("history.json", json.dumps(history, ensure_ascii=False).encode('utf-8'), sha, message)
 
