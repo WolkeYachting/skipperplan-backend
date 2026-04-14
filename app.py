@@ -20,6 +20,7 @@ GITHUB_REPO    = "wolkeyachting/Skipperplan"
 JTC_USER      = os.environ.get("JTC_USER",      "")
 JTC_PASSWORD  = os.environ.get("JTC_PASSWORD",  "")
 APP_PASSWORD  = os.environ.get("APP_PASSWORD",  "")
+GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN",  "")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 NOTIFY_EMAIL   = os.environ.get("NOTIFY_EMAIL",   "")
 
