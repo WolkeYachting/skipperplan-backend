@@ -20,7 +20,8 @@ GITHUB_REPO    = "wolkeyachting/Skipperplan"
 JTC_USER      = os.environ.get("JTC_USER",      "")
 JTC_PASSWORD  = os.environ.get("JTC_PASSWORD",  "")
 APP_PASSWORD  = os.environ.get("APP_PASSWORD",  "")
-GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN",  "")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+NOTIFY_EMAIL   = os.environ.get("NOTIFY_EMAIL",   "")
 
 STAMMSKIPPER = {
     6429:'Julian S', 13707:'Miriam M', 2430:'Gregor K', 13035:'Nicole M',
@@ -409,6 +410,58 @@ def build_excel(rows, skipper_data, changelog=None, currently_sailing=None, past
     buf.seek(0)
     return buf
 
+# ── E-Mail Benachrichtigung ───────────────────────────────────────────────────
+def send_notification(now_str, termine, yachten, changelog, sailing):
+    if not RESEND_API_KEY or not NOTIFY_EMAIL:
+        return
+    th = "padding:8px 12px;text-align:left;border:1px solid #ccc;font-family:Arial"
+    td = "padding:7px 12px;border:1px solid #ddd;font-family:Arial;font-size:13px"
+    type_colors = {'Skipper geändert':'#FFF2CC','Neues Boot':'#E2EFDA',
+                   'Storniert':'#FCE4D6','Neue Bewerbung(en)':'#D6E4F0'}
+    if changelog:
+        cl_rows = "".join(f"""<tr style="background:{type_colors.get(ch.get('typ',''),'#fff')}">
+            <td style="{td}">{ch.get('typ','')}</td><td style="{td}">{ch.get('reisename','')}</td>
+            <td style="{td}">{ch.get('startdatum','')}</td><td style="{td}">{ch.get('yachtmodell','')}</td>
+            <td style="{td}">{ch.get('skipper_name','')}</td><td style="{td}">{ch.get('skipper_alt','')}</td>
+            <td style="{td}">{ch.get('neue_bewerbungen','')}</td></tr>""" for ch in changelog)
+        changelog_html = f"""<h2 style="color:#1F4E79;font-family:Arial;margin-top:24px">
+            Changelog ({len(changelog)} Änderungen)</h2>
+            <table style="border-collapse:collapse;width:100%;font-family:Arial;font-size:13px">
+            <tr style="background:#1F4E79;color:#fff">
+              <th style="{th}">Typ</th><th style="{th}">Reisename</th><th style="{th}">Startdatum</th>
+              <th style="{th}">Yacht</th><th style="{th}">Skipper (neu)</th>
+              <th style="{th}">Skipper (alt)</th><th style="{th}">Neue Bewerbungen</th>
+            </tr>{cl_rows}</table>"""
+    else:
+        changelog_html = '<p style="font-family:Arial;color:#5a7399">Keine Änderungen seit gestern.</p>'
+
+    stat = lambda val, label: f"""<div style="background:#fff;border:1px solid #d0dff0;border-radius:8px;
+        padding:14px 20px;flex:1;text-align:center">
+        <div style="font-size:28px;font-weight:bold;color:#3b82f6;font-family:Arial">{val}</div>
+        <div style="font-size:12px;color:#5a7399;font-family:Arial;text-transform:uppercase">{label}</div></div>"""
+
+    html = f"""<div style="max-width:700px;margin:0 auto;background:#f5f8ff;padding:24px;border-radius:12px">
+      <div style="background:#1F4E79;border-radius:8px;padding:16px 20px;margin-bottom:20px">
+        <span style="font-size:22px">⛵</span>
+        <span style="font-family:Arial;font-size:18px;font-weight:bold;color:#fff;margin-left:10px">Skipperplan – Tagesupdate</span>
+      </div>
+      <p style="font-family:Arial;color:#5a7399;margin-bottom:16px">Aktualisiert: <strong style="color:#1F4E79">{now_str}</strong></p>
+      <div style="display:flex;gap:12px;margin-bottom:20px">
+        {stat(termine,'Termine')}{stat(yachten,'Yachten')}{stat(sailing,'Fahrend')}{stat(len(changelog),'Änderungen')}
+      </div>
+      {changelog_html}
+      <p style="font-family:Arial;font-size:12px;color:#aaa;margin-top:24px">Skipperplan · Flotilla Management</p>
+    </div>"""
+    try:
+        requests.post("https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json={"from": "Skipperplan <onboarding@resend.dev>", "to": [NOTIFY_EMAIL],
+                  "subject": f"⛵ Skipperplan Update – {now_str}", "html": html},
+            timeout=15)
+    except Exception:
+        pass
+
+
 # ── Endpunkte ─────────────────────────────────────────────────────────────────
 def check_password():
     return not APP_PASSWORD or request.args.get("password","") == APP_PASSWORD
@@ -429,7 +482,7 @@ def refresh():
         prev_hits = history.get("daily_hits", [])
         changelog = detect_changes(new_hits, prev_hits, today) if prev_hits else []
         history   = update_sailing_status(history, new_hits, prev_hits, today)
-        if source == "daily":
+        if source == "daily" or not prev_hits:
             history["daily_hits"] = new_hits
         rows         = extract_rows(new_hits)
         skipper_data = build_skipper_data(new_hits)
@@ -442,6 +495,7 @@ def refresh():
         if source == "daily":
             _, sha_daily = gh_get_file("skipperplan_daily.xlsx")
             gh_put_file("skipperplan_daily.xlsx", excel_bytes, sha_daily, f"Täglich: {now_str}")
+            send_notification(now_str, len(new_hits), len(rows), changelog, len(history['currently_sailing']))
         return jsonify({"ok": True, "updated": now_str,
                         "termine": len(new_hits), "yachten": len(rows),
                         "changes": len(changelog), "sailing": len(history['currently_sailing'])})
