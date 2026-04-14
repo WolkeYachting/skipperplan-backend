@@ -98,7 +98,65 @@ def gh_put_file(path, content_bytes, sha, message):
     if resp.status_code not in (200, 201):
         raise RuntimeError(f"GitHub Fehler {resp.status_code}: {resp.text[:200]}")
 
-def load_history():
+def compact_hits(hits):
+    """Reduziert Hits auf die für den Changelog relevanten Felder."""
+    compact = []
+    for h in hits:
+        dest      = h.get('trip_destination', {}) or {}
+        start_ts  = h.get('start_date_min') or first(h.get('start_date', []))
+        end_ts    = first(h.get('end_date', []))
+        proposals = [p['name'] for p in h.get('yacht_skipper_proposals', []) if p.get('name')]
+        for y in h.get('yachts', []):
+            sk = y.get('skipper') or {}
+            compact.append({
+                'k':  f"{h.get('trip_date_id')}_{y.get('id')}",  # yacht_key
+                'tn': h.get('trip_date_id'),
+                'yi': y.get('id'),
+                'rn': dest.get('name', ''),
+                'sd': ts_to_date(start_ts),
+                'si': ts_to_iso(start_ts),
+                'ed': ts_to_date(end_ts),
+                'ei': ts_to_iso(end_ts),
+                'ym': y.get('accomodation_details_name', ''),
+                'yn': y.get('yacht_name', ''),
+                'ys': y.get('status', ''),
+                'sn': sk.get('name', ''),
+                'si2': sk.get('id', ''),
+                'pr': proposals,
+            })
+    return compact
+
+def expand_compact(compact_list):
+    """Wandelt kompakte Hits zurück in das für detect_changes erwartete Format."""
+    hits_by_trip = {}
+    for c in compact_list:
+        tid = c['tn']
+        if tid not in hits_by_trip:
+            hits_by_trip[tid] = {
+                'trip_date_id': tid,
+                'trip_destination': {'name': c['rn']},
+                'start_date': [],
+                'start_date_min': None,
+                'end_date': [],
+                'yacht_skipper_proposals': [{'name': p} for p in c.get('pr', [])],
+                'yachts': [],
+            }
+        hits_by_trip[tid]['yachts'].append({
+            'id': c['yi'],
+            'accomodation_details_name': c['ym'],
+            'yacht_name': c['yn'],
+            'status': c['ys'],
+            'skipper': {'name': c['sn'], 'id': c['si2']},
+        })
+        # Datum aus erstem Yacht-Eintrag nehmen
+        if not hits_by_trip[tid]['start_date_min']:
+            hits_by_trip[tid]['_sd'] = c['sd']
+            hits_by_trip[tid]['_si'] = c['si']
+            hits_by_trip[tid]['_ed'] = c['ed']
+            hits_by_trip[tid]['_ei'] = c['ei']
+    return list(hits_by_trip.values())
+
+
     content, _ = gh_get_file("history.json")
     if content is None:
         return {"daily_hits": [], "currently_sailing": [], "past_trips": []}
@@ -209,8 +267,9 @@ def build_skipper_data(hits):
     return sorted(data.items(), key=lambda x: -x[1]['törns'])
 
 # ── Changelog ────────────────────────────────────────────────────────────────
-def detect_changes(new_hits, prev_hits, today):
-    def index_hits(hits):
+def detect_changes(new_hits, prev_compact, today):
+    """Vergleicht neue Hits mit kompakt gespeicherten vorherigen."""
+    def index_new(hits):
         idx = {}
         for h in hits:
             dest      = h.get('trip_destination', {}) or {}
@@ -223,7 +282,7 @@ def detect_changes(new_hits, prev_hits, today):
                 idx[key] = {
                     'typ': '', 'reisename': dest.get('name', ''),
                     'startdatum': ts_to_date(start_ts), 'start_iso': ts_to_iso(start_ts),
-                    'enddatum': ts_to_date(end_ts), 'end_iso': ts_to_iso(end_ts),
+                    'enddatum': ts_to_date(end_ts),
                     'yachtmodell': y.get('accomodation_details_name', ''),
                     'yachtname': y.get('yacht_name', ''),
                     'skipper_name': sk.get('name', ''), 'skipper_id': sk.get('id', ''),
@@ -232,8 +291,22 @@ def detect_changes(new_hits, prev_hits, today):
                 }
         return idx
 
-    new_idx  = index_hits(new_hits)
-    prev_idx = index_hits(prev_hits)
+    def index_compact(compact_list):
+        idx = {}
+        for c in compact_list:
+            idx[c['k']] = {
+                'typ': '', 'reisename': c['rn'],
+                'startdatum': c['sd'], 'start_iso': c['si'],
+                'enddatum': c['ed'],
+                'yachtmodell': c['ym'], 'yachtname': c['yn'],
+                'skipper_name': c['sn'], 'skipper_id': c['si2'],
+                'yacht_status': c['ys'], 'proposals': c.get('pr', []),
+                'skipper_alt': '', 'neue_bewerbungen': '',
+            }
+        return idx
+
+    new_idx  = index_new(new_hits)
+    prev_idx = index_compact(prev_compact)
     changes  = []
 
     for key, nd in new_idx.items():
@@ -265,21 +338,39 @@ def detect_changes(new_hits, prev_hits, today):
     return changes
 
 # ── Fahrstatus ────────────────────────────────────────────────────────────────
-def update_sailing_status(history, new_hits, prev_hits, today):
+def update_sailing_status(history, new_hits, prev_compact, today):
     new_idx = {f"{h.get('trip_date_id')}_{y.get('id')}": True
                for h in new_hits for y in h.get('yachts', [])}
     existing_keys = {r['_yacht_key'] for r in history.get('currently_sailing', [])}
 
-    for h in prev_hits:
-        proposals = [p['name'] for p in h.get('yacht_skipper_proposals', []) if p.get('name')]
-        for i, y in enumerate(h.get('yachts', [])):
-            key = f"{h.get('trip_date_id')}_{y.get('id')}"
-            if key not in new_idx and key not in existing_keys:
-                row = make_trip_row(h, y, i, proposals)
-                start_iso = row.get('_start_iso', '')
-                end_iso   = row.get('_end_iso', '')
-                if start_iso and start_iso <= today and end_iso >= today:
-                    history['currently_sailing'].append(row)
+    # Kompakte Einträge auf fahrende Boote prüfen
+    for c in prev_compact:
+        key = c['k']
+        if key not in new_idx and key not in existing_keys:
+            start_iso = c.get('si', '')
+            end_iso   = c.get('ei', '')
+            if start_iso and start_iso <= today and end_iso >= today:
+                history['currently_sailing'].append({
+                    '_yacht_key':    key,
+                    '_start_iso':    start_iso,
+                    '_end_iso':      end_iso,
+                    'Startdatum':    c.get('sd', ''),
+                    'Enddatum':      c.get('ed', ''),
+                    'Reisename':     c.get('rn', ''),
+                    'Yachtmodell':   c.get('ym', ''),
+                    'Yachtname':     c.get('yn', ''),
+                    'Skipper':       c.get('sn', '') or '—',
+                    'ID Skipper':    str(c.get('si2', '')),
+                    'Yacht ID':      str(c.get('yi', '')),
+                    'Trip Date ID':  str(c.get('tn', '')),
+                    'Yacht Status':  'Bestätigt',
+                    'Tage': '', 'Altersgruppe': '', 'Saison': '',
+                    'Preisspanne (€)': '', 'Land': '', 'Kontinent': '',
+                    'Anbieter': '', 'Trip ID': '', 'Typ': '',
+                    'Plätze gesamt': '', 'Plätze belegt': '',
+                    'Bootstyp': '', 'Baujahr': '', 'Skipper Status': '',
+                    'Flotillenführer': '', 'Bewerbungen': '',
+                })
 
     cutoff = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(weeks=4)).strftime('%Y-%m-%d')
     still, ended = [], []
@@ -480,11 +571,11 @@ def refresh():
         api_key  = login()
         new_hits = fetch_algolia(api_key)
         history  = load_history()
-        prev_hits = history.get("daily_hits", [])
-        changelog = detect_changes(new_hits, prev_hits, today) if prev_hits else []
-        history   = update_sailing_status(history, new_hits, prev_hits, today)
-        if source == "daily" or not prev_hits:
-            history["daily_hits"] = new_hits
+        prev_compact = history.get("daily_hits", [])
+        changelog = detect_changes(new_hits, prev_compact, today) if prev_compact else []
+        history   = update_sailing_status(history, new_hits, prev_compact, today)
+        if source == "daily" or not prev_compact:
+            history["daily_hits"] = compact_hits(new_hits)
         rows         = extract_rows(new_hits)
         skipper_data = build_skipper_data(new_hits)
         buf          = build_excel(rows, skipper_data, changelog,
