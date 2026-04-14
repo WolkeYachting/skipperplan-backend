@@ -324,7 +324,7 @@ def detect_changes(new_hits, prev_compact, today):
             nd = new_idx[key]
             entry = dict(nd)
             changed = False
-            if pd['skipper_name'] != nd['skipper_name']:
+            if pd['skipper_id'] != nd['skipper_id']:
                 entry['typ'] = 'Skipper geändert'
                 entry['skipper_alt'] = pd['skipper_name'] or '(Kein Skipper)'
                 changed = True
