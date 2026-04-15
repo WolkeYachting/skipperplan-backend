@@ -352,7 +352,32 @@ def detect_changes(new_hits, prev_compact, today):
             if changed:
                 changes.append(entry)
 
-    return sorted(changes, key=lambda x: x.get('start_iso', ''))
+    # Neue Bewerbungen pro Termin zusammenfassen (nicht pro Boot)
+    proposal_by_trip = {}
+    other_changes = []
+    for ch in changes:
+        if ch.get('typ') == 'Neue Bewerbung(en)':
+            tid = ch.get('start_iso','') + '_' + ch.get('reisename','')
+            if tid not in proposal_by_trip:
+                proposal_by_trip[tid] = dict(ch)
+                proposal_by_trip[tid]['_names'] = set(ch.get('neue_bewerbungen','').split(', '))
+                # Prüfen ob mind. ein Boot keinen Skipper hat
+                proposal_by_trip[tid]['_has_free'] = (ch.get('skipper_name','') == '⚠ Kein Skipper')
+            else:
+                proposal_by_trip[tid]['_names'].update(ch.get('neue_bewerbungen','').split(', '))
+                if ch.get('skipper_name','') == '⚠ Kein Skipper':
+                    proposal_by_trip[tid]['_has_free'] = True
+        else:
+            other_changes.append(ch)
+
+    for entry in proposal_by_trip.values():
+        names = ', '.join(sorted(entry['_names']))
+        free  = ' (⚠ freies Boot im Termin)' if entry.get('_has_free') else ''
+        entry['neue_bewerbungen'] = names + free
+        entry['yachtmodell'] = ''  # kein spezifisches Boot mehr
+        other_changes.append(entry)
+
+    return sorted(other_changes, key=lambda x: x.get('start_iso', ''))
 
 # ── Fahrstatus ────────────────────────────────────────────────────────────────
 def update_sailing_status(history, new_hits, prev_compact, today):
@@ -523,44 +548,57 @@ def build_excel(rows, skipper_data, changelog=None, currently_sailing=None, past
 def send_notification(now_str, termine, yachten, changelog, sailing):
     if not RESEND_API_KEY or not NOTIFY_EMAIL:
         return
-    th = "padding:8px 12px;text-align:left;border:1px solid #ccc;font-family:Arial"
-    td = "padding:7px 12px;border:1px solid #ddd;font-family:Arial;font-size:13px"
     type_colors = {'Skipper geändert':'#FFF2CC','Neues Boot':'#E2EFDA',
                    'Storniert':'#FCE4D6','Neue Bewerbung(en)':'#D6E4F0'}
+    th = "padding:8px;text-align:left;border:1px solid #ccc;font-family:Arial;font-size:12px"
+    td = "padding:7px 8px;border:1px solid #ddd;font-family:Arial;font-size:12px"
+
     if changelog:
         cl_rows = "".join(f"""<tr style="background:{type_colors.get(ch.get('typ',''),'#fff')}">
-            <td style="{td}">{ch.get('typ','')}</td><td style="{td}">{ch.get('reisename','')}</td>
-            <td style="{td}">{ch.get('startdatum','')}</td><td style="{td}">{ch.get('yachtmodell','')}</td>
-            <td style="{td}">{ch.get('skipper_name','')}</td><td style="{td}">{ch.get('skipper_alt','')}</td>
-            <td style="{td}">{ch.get('neue_bewerbungen','')}</td></tr>""" for ch in changelog)
-        changelog_html = f"""<h2 style="color:#1F4E79;font-family:Arial;margin-top:24px">
+            <td style="{td}">{ch.get('typ','')}</td>
+            <td style="{td}">{ch.get('reisename','')}</td>
+            <td style="{td};white-space:nowrap">{ch.get('startdatum','')}</td>
+            <td style="{td}">{ch.get('yachtmodell','')}</td>
+            <td style="{td}">{ch.get('skipper_name','') or '—'}</td>
+            <td style="{td}">{ch.get('skipper_alt','')}</td>
+            <td style="{td}">{ch.get('neue_bewerbungen','')}</td>
+            </tr>""" for ch in changelog)
+        changelog_html = f"""
+        <h2 style="color:#1F4E79;font-family:Arial;font-size:14px;margin-top:20px">
             Changelog ({len(changelog)} Änderungen)</h2>
-            <table style="border-collapse:collapse;width:100%;font-family:Arial;font-size:13px">
-            <tr style="background:#1F4E79;color:#fff">
-              <th style="{th}">Typ</th><th style="{th}">Reisename</th><th style="{th}">Startdatum</th>
-              <th style="{th}">Yacht</th><th style="{th}">Skipper (neu)</th>
-              <th style="{th}">Skipper (alt)</th><th style="{th}">Neue Bewerbungen</th>
-            </tr>{cl_rows}</table>"""
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch">
+        <table style="border-collapse:collapse;width:100%;min-width:480px;font-family:Arial">
+          <tr style="background:#1F4E79;color:#fff">
+            <th style="{th}">Typ</th><th style="{th}">Reise</th><th style="{th}">Start</th>
+            <th style="{th}">Yacht</th><th style="{th}">Skipper neu</th>
+            <th style="{th}">Skipper alt</th><th style="{th}">Neue Bewerbungen</th>
+          </tr>{cl_rows}
+        </table></div>"""
     else:
-        changelog_html = '<p style="font-family:Arial;color:#5a7399">Keine Änderungen seit gestern.</p>'
+        changelog_html = '<p style="font-family:Arial;color:#5a7399;font-size:13px">Keine Änderungen seit gestern.</p>'
 
-    stat = lambda val, label: f"""<div style="background:#fff;border:1px solid #d0dff0;border-radius:8px;
-        padding:14px 20px;flex:1;text-align:center">
-        <div style="font-size:28px;font-weight:bold;color:#3b82f6;font-family:Arial">{val}</div>
-        <div style="font-size:12px;color:#5a7399;font-family:Arial;text-transform:uppercase">{label}</div></div>"""
+    def stat(val, label):
+        return f"""<div style="background:#fff;border:1px solid #d0dff0;border-radius:8px;
+            padding:10px 6px;flex:1;text-align:center;min-width:55px">
+            <div style="font-size:20px;font-weight:bold;color:#3b82f6;font-family:Arial">{val}</div>
+            <div style="font-size:10px;color:#5a7399;font-family:Arial;text-transform:uppercase;margin-top:3px">{label}</div>
+            </div>"""
 
-    html = f"""<div style="max-width:700px;margin:0 auto;background:#f5f8ff;padding:24px;border-radius:12px">
-      <div style="background:#1F4E79;border-radius:8px;padding:16px 20px;margin-bottom:20px">
-        <span style="font-size:22px">⛵</span>
-        <span style="font-family:Arial;font-size:18px;font-weight:bold;color:#fff;margin-left:10px">Skipperplan – Tagesupdate</span>
+    html = f"""<!DOCTYPE html><html><body style="margin:0;padding:12px;background:#e8edf5;font-family:Arial">
+    <div style="max-width:600px;margin:0 auto;background:#f5f8ff;padding:16px;border-radius:12px">
+      <div style="background:#1F4E79;border-radius:8px;padding:12px 16px;margin-bottom:14px">
+        <span style="font-size:18px">⛵</span>
+        <span style="font-size:15px;font-weight:bold;color:#fff;margin-left:8px">Skipperplan – Tagesupdate</span>
       </div>
-      <p style="font-family:Arial;color:#5a7399;margin-bottom:16px">Aktualisiert: <strong style="color:#1F4E79">{now_str}</strong></p>
-      <div style="display:flex;gap:12px;margin-bottom:20px">
+      <p style="color:#5a7399;font-size:12px;margin-bottom:14px">
+        Aktualisiert: <strong style="color:#1F4E79">{now_str}</strong></p>
+      <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
         {stat(termine,'Termine')}{stat(yachten,'Yachten')}{stat(sailing,'Fahrend')}{stat(len(changelog),'Änderungen')}
       </div>
       {changelog_html}
-      <p style="font-family:Arial;font-size:12px;color:#aaa;margin-top:24px">Skipperplan · Flotilla Management</p>
-    </div>"""
+      <p style="font-size:11px;color:#aaa;margin-top:16px">Skipperplan · Flotilla Management</p>
+    </div></body></html>"""
+
     try:
         requests.post("https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
