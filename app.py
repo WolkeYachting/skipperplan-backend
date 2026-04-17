@@ -570,7 +570,7 @@ def send_notification(now_str, termine, yachten, changelog, sailing):
         <table style="border-collapse:collapse;width:100%;min-width:480px;font-family:Arial">
           <tr style="background:#1F4E79;color:#fff">
             <th style="{th}">Typ</th><th style="{th}">Reise</th><th style="{th}">Start</th>
-            <th style="{th}">Yacht</th><th style="{th}">Skipper neu</th>
+            <th style="{th}">Yacht</th><th style="{th}">Skipper</th>
             <th style="{th}">Skipper alt</th><th style="{th}">Neue Bewerbungen</th>
           </tr>{cl_rows}
         </table></div>"""
