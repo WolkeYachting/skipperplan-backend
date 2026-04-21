@@ -21,8 +21,8 @@ JTC_USER      = os.environ.get("JTC_USER",      "")
 JTC_PASSWORD  = os.environ.get("JTC_PASSWORD",  "")
 APP_PASSWORD  = os.environ.get("APP_PASSWORD",  "")
 GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN",  "")
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
-NOTIFY_EMAIL   = os.environ.get("NOTIFY_EMAIL",   "")
+GMAIL_USER     = os.environ.get("GMAIL_USER",     "")
+GMAIL_PASSWORD = os.environ.get("GMAIL_PASSWORD", "")
 
 STAMMSKIPPER = {
     6429:'Julian S', 13707:'Miriam M', 2430:'Gregor K', 13035:'Nicole M',
@@ -546,8 +546,15 @@ def build_excel(rows, skipper_data, changelog=None, currently_sailing=None, past
 
 # ── E-Mail Benachrichtigung ───────────────────────────────────────────────────
 def send_notification(now_str, termine, yachten, changelog, sailing):
-    if not RESEND_API_KEY or not NOTIFY_EMAIL:
+    if not GMAIL_USER or not GMAIL_PASSWORD:
         return
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    # Empfänger – kommasepariert in GMAIL_USER oder separate Variable
+    recipients = [m.strip() for m in os.environ.get("NOTIFY_EMAILS", GMAIL_USER).split(',')]
+
     type_colors = {'Skipper geändert':'#FFF2CC','Neues Boot':'#E2EFDA',
                    'Storniert':'#FCE4D6','Neue Bewerbung(en)':'#D6E4F0'}
     th = "padding:8px;text-align:left;border:1px solid #ccc;font-family:Arial;font-size:12px"
@@ -570,7 +577,7 @@ def send_notification(now_str, termine, yachten, changelog, sailing):
         <table style="border-collapse:collapse;width:100%;min-width:480px;font-family:Arial">
           <tr style="background:#1F4E79;color:#fff">
             <th style="{th}">Typ</th><th style="{th}">Reise</th><th style="{th}">Start</th>
-            <th style="{th}">Yacht</th><th style="{th}">Skipper</th>
+            <th style="{th}">Yacht</th><th style="{th}">Skipper neu</th>
             <th style="{th}">Skipper alt</th><th style="{th}">Neue Bewerbungen</th>
           </tr>{cl_rows}
         </table></div>"""
@@ -600,13 +607,17 @@ def send_notification(now_str, termine, yachten, changelog, sailing):
     </div></body></html>"""
 
     try:
-        requests.post("https://api.resend.com/emails",
-            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
-            json={"from": "Skipperplan <onboarding@resend.dev>", "to": [NOTIFY_EMAIL],
-                  "subject": f"⛵ Skipperplan Update – {now_str}", "html": html},
-            timeout=15)
-    except Exception:
-        pass
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = f"⛵ Skipperplan Update – {now_str}"
+        msg['From']    = f"Skipperplan <{GMAIL_USER}>"
+        msg['To']      = ', '.join(recipients)
+        msg.attach(MIMEText(html, 'html'))
+
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+            smtp.login(GMAIL_USER, GMAIL_PASSWORD)
+            smtp.sendmail(GMAIL_USER, recipients, msg.as_string())
+    except Exception as e:
+        print(f"[mail error] {e}")
 
 
 # ── Endpunkte ─────────────────────────────────────────────────────────────────
