@@ -99,7 +99,7 @@ def gh_put_file(path, content_bytes, sha, message):
         raise RuntimeError(f"GitHub Fehler {resp.status_code}: {resp.text[:200]}")
 
 def compact_hits(hits):
-    """Reduziert Hits auf die für den Changelog relevanten Felder."""
+    """Reduziert Hits auf die für den Changelog und Fahrstatus relevanten Felder."""
     compact = []
     for h in hits:
         dest      = h.get('trip_destination', {}) or {}
@@ -109,20 +109,35 @@ def compact_hits(hits):
         for y in h.get('yachts', []):
             sk = y.get('skipper') or {}
             compact.append({
-                'k':  f"{h.get('trip_date_id')}_{y.get('id')}",  # yacht_key
-                'tn': h.get('trip_date_id'),
-                'yi': y.get('id'),
-                'rn': dest.get('name', ''),
-                'sd': ts_to_date(start_ts),
-                'si': ts_to_iso(start_ts),
-                'ed': ts_to_date(end_ts),
-                'ei': ts_to_iso(end_ts),
-                'ym': y.get('accomodation_details_name', ''),
-                'yn': y.get('yacht_name', ''),
-                'ys': y.get('status', ''),
-                'sn': sk.get('name', ''),
+                'k':   f"{h.get('trip_date_id')}_{y.get('id')}",
+                'tn':  h.get('trip_date_id'),
+                'ti':  h.get('trip_id', ''),
+                'yi':  y.get('id'),
+                'rn':  dest.get('name', ''),
+                'sd':  ts_to_date(start_ts),
+                'si':  ts_to_iso(start_ts),
+                'ed':  ts_to_date(end_ts),
+                'ei':  ts_to_iso(end_ts),
+                'ym':  y.get('accomodation_details_name', ''),
+                'yn':  y.get('yacht_name', ''),
+                'yt':  y.get('accomodation_details_type', ''),
+                'yy':  y.get('yacht_year', ''),
+                'ys':  y.get('status', ''),
+                'sn':  sk.get('name', ''),
                 'si2': sk.get('id', ''),
-                'pr': proposals,
+                'sst': sk.get('status', ''),
+                'sfl': sk.get('is_flotilla_leader', False),
+                'pl':  y.get('places', ''),
+                'po':  y.get('occupied_places', ''),
+                'pr':  proposals,
+                'tg':  first(h.get('trip_days', [])),
+                'ag':  first(h.get('age_range', [])),
+                'sa':  first(h.get('season', [])),
+                'pp':  first(h.get('price_range', [])),
+                'la':  dest.get('country', ''),
+                'co':  dest.get('continent', ''),
+                'an':  h.get('vendor', ''),
+                'ty':  h.get('type', ''),
             })
     return compact
 
@@ -399,19 +414,29 @@ def update_sailing_status(history, new_hits, prev_compact, today):
                     'Startdatum':    c.get('sd', ''),
                     'Enddatum':      c.get('ed', ''),
                     'Reisename':     c.get('rn', ''),
-                    'Yachtmodell':   c.get('ym', ''),
-                    'Yachtname':     c.get('yn', ''),
+                    'Typ':           c.get('ty', ''),
+                    'Tage':          c.get('tg', ''),
+                    'Altersgruppe':  c.get('ag', ''),
+                    'Saison':        c.get('sa', ''),
+                    'Preisspanne (€)': c.get('pp', ''),
+                    'Land':          c.get('la', ''),
+                    'Kontinent':     c.get('co', ''),
+                    'Anbieter':      c.get('an', ''),
+                    'Trip ID':       str(c.get('ti', '')),
+                    'Trip Date ID':  str(c.get('tn', '')),
                     'Skipper':       c.get('sn', '') or '—',
                     'ID Skipper':    str(c.get('si2', '')),
+                    'Plätze gesamt': c.get('pl', ''),
+                    'Plätze belegt': c.get('po', ''),
                     'Yacht ID':      str(c.get('yi', '')),
-                    'Trip Date ID':  str(c.get('tn', '')),
+                    'Yachtmodell':   c.get('ym', ''),
+                    'Yachtname':     c.get('yn', ''),
+                    'Bootstyp':      c.get('yt', ''),
+                    'Baujahr':       c.get('yy', ''),
                     'Yacht Status':  'Bestätigt',
-                    'Tage': '', 'Altersgruppe': '', 'Saison': '',
-                    'Preisspanne (€)': '', 'Land': '', 'Kontinent': '',
-                    'Anbieter': '', 'Trip ID': '', 'Typ': '',
-                    'Plätze gesamt': '', 'Plätze belegt': '',
-                    'Bootstyp': '', 'Baujahr': '', 'Skipper Status': '',
-                    'Flotillenführer': '', 'Bewerbungen': '',
+                    'Skipper Status': SKIPPER_STATUS_LABELS.get(c.get('sst',''), c.get('sst','') or '—'),
+                    'Flotillenführer': 'Ja' if c.get('sfl') else 'Nein',
+                    'Bewerbungen':   ', '.join(c.get('pr', [])),
                 })
 
     cutoff = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(weeks=4)).strftime('%Y-%m-%d')
@@ -424,8 +449,7 @@ def update_sailing_status(history, new_hits, prev_compact, today):
     for row in ended:
         if row['_yacht_key'] not in past_keys:
             history['past_trips'].append(row)
-    history['past_trips'] = [r for r in history.get('past_trips', [])
-                              if r.get('_end_iso','') >= cutoff]
+    history['past_trips'] = history.get('past_trips', [])
     return history
 
 # ── Excel bauen (xlsxwriter) ──────────────────────────────────────────────────
