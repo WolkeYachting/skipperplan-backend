@@ -21,8 +21,8 @@ JTC_USER      = os.environ.get("JTC_USER",      "")
 JTC_PASSWORD  = os.environ.get("JTC_PASSWORD",  "")
 APP_PASSWORD  = os.environ.get("APP_PASSWORD",  "")
 GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN",  "")
-GMAIL_USER     = os.environ.get("GMAIL_USER",     "")
-GMAIL_PASSWORD = os.environ.get("GMAIL_PASSWORD", "")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+NOTIFY_EMAILS  = os.environ.get("NOTIFY_EMAILS",  "")
 
 STAMMSKIPPER = {
     6429:'Julian S', 13707:'Miriam M', 2430:'Gregor K', 13035:'Nicole M',
@@ -570,14 +570,12 @@ def build_excel(rows, skipper_data, changelog=None, currently_sailing=None, past
 
 # ── E-Mail Benachrichtigung ───────────────────────────────────────────────────
 def send_notification(now_str, termine, yachten, changelog, sailing):
-    if not GMAIL_USER or not GMAIL_PASSWORD:
+    if not RESEND_API_KEY:
         return
-    import smtplib
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.text import MIMEText
 
-    # Empfänger – kommasepariert in GMAIL_USER oder separate Variable
-    recipients = [m.strip() for m in os.environ.get("NOTIFY_EMAILS", GMAIL_USER).split(',')]
+    recipients = [m.strip() for m in NOTIFY_EMAILS.split(',') if m.strip()] if NOTIFY_EMAILS else []
+    if not recipients:
+        return
 
     type_colors = {'Skipper geändert':'#FFF2CC','Neues Boot':'#E2EFDA',
                    'Storniert':'#FCE4D6','Neue Bewerbung(en)':'#D6E4F0'}
@@ -631,17 +629,17 @@ def send_notification(now_str, termine, yachten, changelog, sailing):
     </div></body></html>"""
 
     try:
-        msg = MIMEMultipart('alternative')
-        msg['Subject'] = f"⛵ Skipperplan Update – {now_str}"
-        msg['From']    = f"Skipperplan <{GMAIL_USER}>"
-        msg['To']      = ', '.join(recipients)
-        msg.attach(MIMEText(html, 'html'))
-
-        with smtplib.SMTP('smtp.gmail.com', 587) as smtp:
-            smtp.ehlo()
-            smtp.starttls()
-            smtp.login(GMAIL_USER, GMAIL_PASSWORD)
-            smtp.sendmail(GMAIL_USER, recipients, msg.as_string())
+        requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "from":    "Skipperplan <onboarding@resend.dev>",
+                "to":      recipients,
+                "subject": f"⛵ Skipperplan Update – {now_str}",
+                "html":    html,
+            },
+            timeout=15,
+        )
     except Exception as e:
         print(f"[mail error] {e}")
 
