@@ -637,7 +637,9 @@ def send_notification(now_str, termine, yachten, changelog, sailing):
         msg['To']      = ', '.join(recipients)
         msg.attach(MIMEText(html, 'html'))
 
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+        with smtplib.SMTP('smtp.gmail.com', 587) as smtp:
+            smtp.ehlo()
+            smtp.starttls()
             smtp.login(GMAIL_USER, GMAIL_PASSWORD)
             smtp.sendmail(GMAIL_USER, recipients, msg.as_string())
     except Exception as e:
