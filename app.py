@@ -1,732 +1,1282 @@
 """
-app.py  –  Skipperplan Backend (xlsxwriter)
+SailTrack Backend – v3 Datenmodell (Segment-Split)
+
+WARUM v3
+--------
+Bis v2 lag ein Toern in EINER Datei: ein flacher LineString plus ein
+paralleles `timestamps`-Array, sortiert nach t. Das war der Grund, warum der
+Uhrsprung vom 19.06.2026 (~+3557 s) so verheerend war: Die falsch gestempelten
+Punkte wurden zwischen die zeitgleich aufgenommenen echten Punkte einsortiert.
+Aus 220 nm wurden 4341 nm.
+
+Die Zeitbasis der App (clock.dart) verhindert das jetzt. Was bleibt, ist der
+Fall, den sie NICHT abfangen kann: Reboot mitten im Toern, Systemuhr steht in
+dem Moment falsch -> der neue Anker ist falsch -> die ganze folgende Aufnahme
+ist verschoben. Lokal nicht erkennbar (in sich konsistent), und im
+Ein-Datei-Modell wuerde sie sich beim Sortieren mit der vorherigen Aufnahme
+vermischen.
+
+v3 zieht die Konsequenz:
+
+    Neuer Anker  ->  neues Segment  ->  eigene Datei.
+
+Innerhalb einer Datei gilt Monotonie. UEBER Dateien hinweg wird nie sortiert --
+die Reihenfolge ergibt sich aus der Segmentnummer. Zeitliche Ueberlappung
+zweier Segmente ist damit ein ANZEIGE-Hinweis (`conflict`), kein Datenschaden.
+Und eine nachtraegliche Zeitkorrektur ist ein simples Verschieben genau einer
+Datei.
+
+DATEILAYOUT
+-----------
+    tracks/<hash>/<hash>.geojson        Manifest: Toern-Meta + Segment-Index
+    tracks/<hash>/<hash>-s001.geojson   Segment: LineString + timestamps + Anker
+    tracks/<hash>/<hash>-s002.geojson
+
+`pauses` faellt ersatzlos weg: Die Luecke zwischen zwei Segmenten IST die Pause.
+(Passte schon vorher exakt -- Pausen entstanden genau beim stopTracking.)
+
+Das Manifest traegt pro Segment `point_count` und `ts_hash`. Damit ist
+GET /digest ein einziger kleiner Dateizugriff statt eines Vollscans.
 """
-from flask import Flask, jsonify, request
+
+import base64
+import bisect
+import hashlib
+import json
+import math
+import os
+import re
+import secrets
+import time
+from datetime import datetime, timezone
+
+import requests
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-import requests, os, io, re, datetime, json, base64
-import xlsxwriter
 
 app = Flask(__name__)
-CORS(app, origins=["https://wolkeyachting.github.io"])
+CORS(app)
 
-JTC_BASE       = "https://api-aws.join-the-crew.com"
-JTC_HEADERS    = {"Accept":"application/json, text/plain, */*","Accept-Language":"de,en-US;q=0.9,en;q=0.8","Origin":"https://join-the-crew.com","Referer":"https://join-the-crew.com/","X-Vendor":"jtc"}
-ALGOLIA_HOST   = "https://m6n4q601zw-dsn.algolia.net"
-ALGOLIA_APP_ID = "M6N4Q601ZW"
-ALGOLIA_INDEX  = "prod_trip_dates_skipperplan_de"
-HITS_PER_PAGE  = 100
-GITHUB_REPO    = "wolkeyachting/Skipperplan"
+# ============================================================================
+# Config
+# ============================================================================
 
-JTC_USER      = os.environ.get("JTC_USER",      "")
-JTC_PASSWORD  = os.environ.get("JTC_PASSWORD",  "")
-APP_PASSWORD  = os.environ.get("APP_PASSWORD",  "")
-GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN",  "")
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
-NOTIFY_EMAILS  = os.environ.get("NOTIFY_EMAILS",  "")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "wolkeyachting")
+DATA_REPO    = os.environ.get("DATA_REPO", "sailtrack")
+ADMIN_REPO   = os.environ.get("ADMIN_REPO", "sailtrack-admin")
+ADMIN_TOKEN  = os.environ.get("SAILTRACK_ADMIN_TOKEN", "")
 
-STAMMSKIPPER = {
-    6429:'Julian S', 13707:'Miriam M', 2430:'Gregor K', 13035:'Nicole M',
-    951:'Martin S',  14111:'Leon H',   17277:'David H',  28325:'Adam B',
-    7022:'Mareike W',20147:'Yanik K',  6896:'Malte W',   9724:'Luke W',
-    6758:'Marc L',   347:'Mario L',    9375:'Clemens P',
+LEGACY_TOKENS_RAW = os.environ.get("SAILTRACK_TOKENS", "")
+LEGACY_TOKENS = {
+    kv.split("=", 1)[0].strip(): kv.split("=", 1)[1].strip()
+    for kv in LEGACY_TOKENS_RAW.split(",")
+    if "=" in kv
 }
 
-COLUMN_ORDER = [
-    'Startdatum','Enddatum','Reisename','Typ','Tage','Altersgruppe',
-    'Skipper','ID Skipper','Plätze gesamt','Plätze belegt',
-    'Saison','Preisspanne (€)','Land','Kontinent','Anbieter',
-    'Trip ID','Trip Date ID','Yacht ID','Yachtmodell','Yachtname',
-    'Bootstyp','Baujahr','Yacht Status','Skipper Status','Flotillenführer','Bewerbungen',
-]
-COL_WIDTHS = {
-    'Startdatum':12,'Enddatum':12,'Reisename':28,'Typ':10,'Tage':7,'Altersgruppe':13,
-    'Skipper':20,'ID Skipper':10,'Plätze gesamt':14,'Plätze belegt':14,'Saison':9,
-    'Preisspanne (€)':15,'Land':12,'Kontinent':11,'Anbieter':10,'Trip ID':9,
-    'Trip Date ID':13,'Yacht ID':10,'Yachtmodell':22,'Yachtname':18,'Bootstyp':12,
-    'Baujahr':9,'Yacht Status':15,'Skipper Status':22,'Flotillenführer':15,'Bewerbungen':40,
-}
+CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+CODE_LENGTH   = 12
 
-SKIPPER_STATUS_LABELS = {
-    'confirmed_by_admin_and_skipper': 'Bestätigt',
-    'confirmed_by_admin':             'Vom Admin bestätigt',
-    'assigned':                       'Zugeteilt (offen)',
-}
+LAST_SEEN_THROTTLE_SEC = 300
+_last_seen_debounce = {}
 
-# ── Hilfsfunktionen ───────────────────────────────────────────────────────────
-def ts_to_date(ts):
-    if not ts: return ''
-    try: return datetime.datetime.fromtimestamp(int(ts), datetime.UTC).strftime('%d.%m.%Y')
-    except: return ''
+SEG_RE = re.compile(r"^s\d{3}$")
 
-def ts_to_iso(ts):
-    if not ts: return ''
-    try: return datetime.datetime.fromtimestamp(int(ts), datetime.UTC).strftime('%Y-%m-%d')
-    except: return ''
+# ============================================================================
+# Helpers
+# ============================================================================
 
-def first(lst, default=''):
-    return lst[0] if lst else default
+def now_iso():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-def days_to_weeks(days):
-    return round(days / 7)
+def generate_code():
+    return "".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LENGTH))
 
-def parse_days(s):
-    m = re.search(r'(\d+)', str(s or ''))
-    return int(m.group(1)) if m else 7
+def generate_skipper_token():
+    return secrets.token_urlsafe(32)
 
-def today_iso():
-    return datetime.datetime.now(datetime.UTC).strftime('%Y-%m-%d')
+def hash_code(code):
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
-# ── GitHub API ────────────────────────────────────────────────────────────────
+def haversine_nm(lat1, lon1, lat2, lon2):
+    R_nm = 3440.065
+    f1, f2 = math.radians(lat1), math.radians(lat2)
+    df = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(df/2)**2 + math.cos(f1) * math.cos(f2) * math.sin(dl/2)**2
+    return 2 * R_nm * math.asin(math.sqrt(a))
+
+def _norm_ts(timestamps):
+    """Kanonische Punkt-Identitaet INNERHALB eines Segments: auf ganze Sekunden
+    trunkieren, deduplizieren, sortieren.
+
+    Wichtig: Die Identitaet ist ab v3 (track, segment, t) -- nicht mehr
+    (track, t). Zwei Segmente duerfen dieselbe Sekunde tragen; das ist genau
+    der Reboot-mit-falscher-Uhr-Fall. Deshalb wird hier IMMER nur ueber die
+    Timestamps EINES Segments gerechnet, nie ueber den ganzen Toern.
+    """
+    return sorted({int(t) for t in timestamps})
+
+def ts_hash(timestamps):
+    """
+    Fingerabdruck ueber die kanonische Timestamp-Folge EINES SEGMENTS.
+
+    Muss bitgenau zur Dart-Seite passen (fnv1a64Hex in store.dart), die ueber
+    die Int-Sekunden der pending_points eines Segments rechnet. FNV-1a, 64 Bit,
+    ueber die mit "," verbundenen Dezimal-Strings der sortierten Ints.
+    """
+    ints = _norm_ts(timestamps)
+    s = ",".join(str(x) for x in ints)
+    h = 0xcbf29ce484222325
+    for b in s.encode("utf-8"):
+        h = ((h ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return format(h, "016x")
+
+# ============================================================================
+# Pfade
+# ============================================================================
+
+def track_dir(file_hash):
+    return f"tracks/{file_hash}"
+
+def manifest_path(file_hash):
+    return f"tracks/{file_hash}/{file_hash}.geojson"
+
+def segment_path(file_hash, seg):
+    return f"tracks/{file_hash}/{file_hash}-{seg}.geojson"
+
+def legacy_path(file_hash):
+    """v2: eine Datei direkt unter tracks/."""
+    return f"tracks/{file_hash}.geojson"
+
+# ============================================================================
+# GitHub API
+# ============================================================================
+
+GH_API = "https://api.github.com"
+
 def gh_headers():
-    return {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
-
-def gh_get_file(path):
-    resp = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}",
-                        headers=gh_headers(), timeout=15)
-    if resp.status_code == 404:
-        return None, None
-    resp.raise_for_status()
-    data = resp.json()
-    return base64.b64decode(data['content']), data['sha']
-
-def gh_put_file(path, content_bytes, sha, message):
-    payload = {"message": message, "content": base64.b64encode(content_bytes).decode()}
-    if sha:
-        payload["sha"] = sha
-    resp = requests.put(f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}",
-                        headers=gh_headers(), json=payload, timeout=30)
-    if resp.status_code not in (200, 201):
-        raise RuntimeError(f"GitHub Fehler {resp.status_code}: {resp.text[:200]}")
-
-def compact_hits(hits):
-    """Reduziert Hits auf die für den Changelog und Fahrstatus relevanten Felder."""
-    compact = []
-    for h in hits:
-        dest      = h.get('trip_destination', {}) or {}
-        start_ts  = h.get('start_date_min') or first(h.get('start_date', []))
-        end_ts    = first(h.get('end_date', []))
-        proposals = [p['name'] for p in h.get('yacht_skipper_proposals', []) if p.get('name')]
-        for y in h.get('yachts', []):
-            sk = y.get('skipper') or {}
-            compact.append({
-                'k':   f"{h.get('trip_date_id')}_{y.get('id')}",
-                'tn':  h.get('trip_date_id'),
-                'ti':  h.get('trip_id', ''),
-                'yi':  y.get('id'),
-                'rn':  dest.get('name', ''),
-                'sd':  ts_to_date(start_ts),
-                'si':  ts_to_iso(start_ts),
-                'ed':  ts_to_date(end_ts),
-                'ei':  ts_to_iso(end_ts),
-                'ym':  y.get('accomodation_details_name', ''),
-                'yn':  y.get('yacht_name', ''),
-                'yt':  y.get('accomodation_details_type', ''),
-                'yy':  y.get('yacht_year', ''),
-                'ys':  y.get('status', ''),
-                'sn':  sk.get('name', ''),
-                'si2': sk.get('id', ''),
-                'sst': sk.get('status', ''),
-                'sfl': sk.get('is_flotilla_leader', False),
-                'pl':  y.get('places', ''),
-                'po':  y.get('occupied_places', ''),
-                'pr':  proposals,
-                'tg':  first(h.get('trip_days', [])),
-                'ag':  first(h.get('age_range', [])),
-                'sa':  first(h.get('season', [])),
-                'pp':  first(h.get('price_range', [])),
-                'la':  dest.get('country', ''),
-                'co':  dest.get('continent', ''),
-                'an':  h.get('vendor', ''),
-                'ty':  h.get('type', ''),
-            })
-    return compact
-
-def expand_compact(compact_list):
-    """Wandelt kompakte Hits zurück in das für detect_changes erwartete Format."""
-    hits_by_trip = {}
-    for c in compact_list:
-        tid = c['tn']
-        if tid not in hits_by_trip:
-            hits_by_trip[tid] = {
-                'trip_date_id': tid,
-                'trip_destination': {'name': c['rn']},
-                'start_date': [],
-                'start_date_min': None,
-                'end_date': [],
-                'yacht_skipper_proposals': [{'name': p} for p in c.get('pr', [])],
-                'yachts': [],
-            }
-        hits_by_trip[tid]['yachts'].append({
-            'id': c['yi'],
-            'accomodation_details_name': c['ym'],
-            'yacht_name': c['yn'],
-            'status': c['ys'],
-            'skipper': {'name': c['sn'], 'id': c['si2']},
-        })
-        # Datum aus erstem Yacht-Eintrag nehmen
-        if not hits_by_trip[tid]['start_date_min']:
-            hits_by_trip[tid]['_sd'] = c['sd']
-            hits_by_trip[tid]['_si'] = c['si']
-            hits_by_trip[tid]['_ed'] = c['ed']
-            hits_by_trip[tid]['_ei'] = c['ei']
-    return list(hits_by_trip.values())
-
-
-def load_history():
-    content, _ = gh_get_file("history.json")
-    if content:
-        try:
-            return json.loads(content.decode('utf-8'))
-        except Exception:
-            pass
-    # Fallback: Backup laden
-    backup, _ = gh_get_file("history_backup.json")
-    if backup:
-        try:
-            print("[load_history] history.json leer/kaputt – lade Backup")
-            return json.loads(backup.decode('utf-8'))
-        except Exception:
-            pass
-    return {"daily_hits": [], "currently_sailing": [], "past_trips": []}
-
-def save_history(history, message="History aktualisiert"):
-    # Erst Backup der aktuellen Version anlegen
-    current, sha_backup = gh_get_file("history_backup.json")
-    if current is not None:
-        gh_put_file("history_backup.json", current, sha_backup, f"Backup: {message}")
-    # Dann neue Version speichern
-    _, sha = gh_get_file("history.json")
-    gh_put_file("history.json", json.dumps(history, ensure_ascii=False).encode('utf-8'), sha, message)
-
-# ── Daten laden ───────────────────────────────────────────────────────────────
-def login():
-    resp = requests.post(f"{JTC_BASE}/de/api/users/login",
-                         json={"user": JTC_USER, "password": JTC_PASSWORD},
-                         headers=JTC_HEADERS, timeout=15)
-    resp.raise_for_status()
-    key = (resp.json().get("api_keys") or {}).get("algolia", {}).get("skipperplan")
-    if not key: raise ValueError("Algolia-Key nicht gefunden")
-    return key
-
-def fetch_algolia(api_key):
-    hdrs = {"x-algolia-application-id": ALGOLIA_APP_ID, "x-algolia-api-key": api_key, "Content-Type": "application/json"}
-    all_hits, page, total = [], 0, None
-    while True:
-        body = {"requests": [{"indexName": ALGOLIA_INDEX, "params": f"hitsPerPage={HITS_PER_PAGE}&page={page}&query="}]}
-        resp = requests.post(f"{ALGOLIA_HOST}/1/indexes/*/queries", headers=hdrs, json=body, timeout=30)
-        resp.raise_for_status()
-        result = resp.json()["results"][0]
-        hits   = result.get("hits", [])
-        all_hits.extend(hits)
-        if total is None: total = result.get("nbHits", 0)
-        if len(all_hits) >= total or len(hits) < HITS_PER_PAGE: break
-        page += 1
-    seen, unique = set(), []
-    for h in all_hits:
-        tid = h.get("trip_date_id") or h.get("objectID")
-        if tid not in seen:
-            seen.add(tid); unique.append(h)
-    return unique
-
-# ── Zeilen extrahieren ────────────────────────────────────────────────────────
-def make_trip_row(h, y, i, proposals):
-    dest      = h.get('trip_destination', {}) or {}
-    start_ts  = h.get('start_date_min') or first(h.get('start_date', []))
-    end_ts    = first(h.get('end_date', []))
-    sk        = (y.get('skipper') or {})
-    sk_status = sk.get('status', '')
-    sk_name   = sk.get('name', '')
-    ys        = y.get('status', '')
-    if ys == 'should_be_canceled':  color = 'cancel'
-    elif not sk_name:               color = 'no_skipper'
-    elif sk_status == 'assigned':   color = 'unconfirmed'
-    else:                           color = None
     return {
-        'Startdatum':      ts_to_date(start_ts),
-        'Enddatum':        ts_to_date(end_ts),
-        '_start_iso':      ts_to_iso(start_ts),
-        '_end_iso':        ts_to_iso(end_ts),
-        '_yacht_key':      f"{h.get('trip_date_id')}_{y.get('id')}",
-        '_color':          color,
-        'Reisename':       dest.get('name', ''),
-        'Typ':             h.get('type', ''),
-        'Tage':            first(h.get('trip_days', [])),
-        'Altersgruppe':    first(h.get('age_range', [])),
-        'Saison':          first(h.get('season', [])),
-        'Preisspanne (€)': first(h.get('price_range', [])),
-        'Land':            dest.get('country', ''),
-        'Kontinent':       dest.get('continent', ''),
-        'Anbieter':        h.get('vendor', ''),
-        'Trip ID':         str(h.get('trip_id', '')),
-        'Trip Date ID':    str(h.get('trip_date_id', '')),
-        'Skipper':         sk_name if sk_name else '⚠ Kein Skipper',
-        'ID Skipper':      str(sk.get('id', '')),
-        'Plätze gesamt':   y.get('places', ''),
-        'Plätze belegt':   y.get('occupied_places', ''),
-        'Yacht ID':        str(y.get('id', '')),
-        'Yachtmodell':     y.get('accomodation_details_name', ''),
-        'Yachtname':       y.get('yacht_name', ''),
-        'Bootstyp':        y.get('accomodation_details_type', ''),
-        'Baujahr':         y.get('yacht_year', ''),
-        'Yacht Status':    'Zu stornieren' if ys == 'should_be_canceled' else 'Bestätigt',
-        'Skipper Status':  SKIPPER_STATUS_LABELS.get(sk_status, sk_status or '—'),
-        'Flotillenführer': 'Ja' if sk.get('is_flotilla_leader') else 'Nein',
-        'Bewerbungen':     ', '.join(proposals) if i == 0 else '',
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
     }
 
-def extract_rows(hits):
-    rows = []
-    for h in hits:
-        proposals = [p['name'] for p in h.get('yacht_skipper_proposals', []) if p.get('name')]
-        for i, y in enumerate(h.get('yachts', [])):
-            rows.append(make_trip_row(h, y, i, proposals))
-    return rows
+def gh_get_file(repo, path):
+    """
+    Liest eine JSON-Datei aus dem Repo.
 
-def build_skipper_data(hits):
-    from collections import defaultdict
-    data = defaultdict(lambda: {'name':'','törns':0,'total_weeks':0,'summer_weeks':0})
-    for h in hits:
-        weeks  = days_to_weeks(parse_days(first(h.get('trip_days', []))))
-        season = (first(h.get('season', '')) or '').lower()
-        for y in h.get('yachts', []):
-            sk = y.get('skipper') or {}
-            if not sk.get('id') or not sk.get('name'): continue
-            d = data[sk['id']]
-            d['name'] = sk['name']
-            d['törns'] += 1
-            d['total_weeks'] += weeks
-            if season == 'summer': d['summer_weeks'] += weeks
-    return sorted(data.items(), key=lambda x: -x[1]['törns'])
+    Die Contents-API liefert `content` nur inline, solange die Datei < 1 MB ist.
+    Ab 1 MB ist `content` leer und `encoding` == "none" -> der Inhalt muss ueber
+    die Git Blob API (per `git_url`) nachgeladen werden. Die Blob-API hat kein
+    1-MB-Limit (bis 100 MB).
 
-# ── Changelog ────────────────────────────────────────────────────────────────
-def detect_changes(new_hits, prev_compact, today):
-    """Vergleicht neue Hits mit kompakt gespeicherten vorherigen."""
-    def index_new(hits):
-        idx = {}
-        for h in hits:
-            dest      = h.get('trip_destination', {}) or {}
-            start_ts  = h.get('start_date_min') or first(h.get('start_date', []))
-            end_ts    = first(h.get('end_date', []))
-            proposals = [p['name'] for p in h.get('yacht_skipper_proposals', []) if p.get('name')]
-            for y in h.get('yachts', []):
-                key = f"{h.get('trip_date_id')}_{y.get('id')}"
-                sk  = y.get('skipper') or {}
-                idx[key] = {
-                    'typ': '', 'reisename': dest.get('name', ''),
-                    'startdatum': ts_to_date(start_ts), 'start_iso': ts_to_iso(start_ts),
-                    'enddatum': ts_to_date(end_ts),
-                    'yachtmodell': y.get('accomodation_details_name', ''),
-                    'yachtname': y.get('yacht_name', ''),
-                    'skipper_name': sk.get('name', ''), 'skipper_id': sk.get('id', ''),
-                    'yacht_status': y.get('status', ''), 'proposals': proposals,
-                    'skipper_alt': '', 'neue_bewerbungen': '',
-                }
-        return idx
+    Rueckgabe: (parsed_dict_oder_None, blob_sha_oder_None)
+    """
+    url = f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/contents/{path}"
+    r = requests.get(url, headers=gh_headers(), timeout=30)
+    if r.status_code == 404:
+        return None, None
+    r.raise_for_status()
+    data = r.json()
 
-    def index_compact(compact_list):
-        idx = {}
-        for c in compact_list:
-            idx[c['k']] = {
-                'typ': '', 'reisename': c['rn'],
-                'startdatum': c['sd'], 'start_iso': c['si'],
-                'enddatum': c['ed'],
-                'yachtmodell': c['ym'], 'yachtname': c['yn'],
-                'skipper_name': c['sn'], 'skipper_id': c['si2'],
-                'yacht_status': c['ys'], 'proposals': c.get('pr', []),
-                'skipper_alt': '', 'neue_bewerbungen': '',
-            }
-        return idx
+    if isinstance(data, list):
+        # Pfad ist ein Verzeichnis -- als Datei gelesen ist das ein Fehler.
+        return None, None
 
-    new_idx  = index_new(new_hits)
-    prev_idx = index_compact(prev_compact)
-    changes  = []
+    if data.get("encoding") == "base64" and data.get("content"):
+        raw = base64.b64decode(data["content"])
+    else:
+        blob = requests.get(data["git_url"], headers=gh_headers(), timeout=30)
+        blob.raise_for_status()
+        raw = base64.b64decode(blob.json()["content"])
 
-    for key, nd in new_idx.items():
-        if key not in prev_idx:
-            entry = dict(nd); entry['typ'] = 'Neues Boot'
-            changes.append(entry)
+    text = raw.decode("utf-8")
+    if not text.strip():
+        return None, data["sha"]
+    return json.loads(text), data["sha"]
 
-    for key, pd in prev_idx.items():
-        if key not in new_idx:
-            if pd['start_iso'] > today:
-                entry = dict(pd); entry['typ'] = 'Storniert'; entry['skipper_alt'] = pd['skipper_name']
-                changes.append(entry)
-        else:
-            nd = new_idx[key]
-            entry = dict(nd)
-            changed = False
-            if pd['skipper_id'] != nd['skipper_id']:
-                entry['typ'] = 'Skipper geändert'
-                entry['skipper_alt'] = pd['skipper_name'] or '(Kein Skipper)'
-                changed = True
-            new_proposals = [p for p in nd['proposals'] if p not in pd['proposals']]
-            if new_proposals:
-                entry['neue_bewerbungen'] = ', '.join(new_proposals)
-                if not changed: entry['typ'] = 'Neue Bewerbung(en)'
-                changed = True
-            if changed:
-                changes.append(entry)
+def gh_list_dir(repo, path):
+    """Dateinamen eines Verzeichnisses. Leere Liste, wenn es nicht existiert."""
+    url = f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/contents/{path}"
+    r = requests.get(url, headers=gh_headers(), timeout=30)
+    if r.status_code == 404:
+        return []
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, list):
+        return []
+    return [e["path"] for e in data if e.get("type") == "file"]
 
-    # Neue Bewerbungen pro Termin zusammenfassen (nicht pro Boot)
-    proposal_by_trip = {}
-    other_changes = []
-    for ch in changes:
-        if ch.get('typ') == 'Neue Bewerbung(en)':
-            tid = ch.get('start_iso','') + '_' + ch.get('reisename','')
-            if tid not in proposal_by_trip:
-                proposal_by_trip[tid] = dict(ch)
-                proposal_by_trip[tid]['_names'] = set(ch.get('neue_bewerbungen','').split(', '))
-                # Prüfen ob mind. ein Boot keinen Skipper hat
-                proposal_by_trip[tid]['_has_free'] = (ch.get('skipper_name','') == '⚠ Kein Skipper')
-            else:
-                proposal_by_trip[tid]['_names'].update(ch.get('neue_bewerbungen','').split(', '))
-                if ch.get('skipper_name','') == '⚠ Kein Skipper':
-                    proposal_by_trip[tid]['_has_free'] = True
-        else:
-            other_changes.append(ch)
+def _gh_default_branch(repo):
+    r = requests.get(
+        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}",
+        headers=gh_headers(), timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()["default_branch"]
 
-    for entry in proposal_by_trip.values():
-        names = ', '.join(sorted(entry['_names']))
-        free  = ' (⚠ freies Boot im Termin)' if entry.get('_has_free') else ''
-        entry['neue_bewerbungen'] = names + free
-        entry['yachtmodell'] = ''  # kein spezifisches Boot mehr
-        other_changes.append(entry)
+def gh_commit_files(repo, writes, deletes, message):
+    """
+    Schreibt und loescht MEHRERE Dateien in EINEM Commit (Git Data API).
 
-    return sorted(other_changes, key=lambda x: x.get('start_iso', ''))
+    Das ist ab v3 der Normalfall: Ein Punkte-Append fasst Segmentdatei UND
+    Manifest an. Beides in einem Commit heisst: Es kann keinen Zustand geben,
+    in dem das Manifest andere Zahlen behauptet, als in den Segmenten stehen.
+    Zwei getrennte Commits koennten genau dort auseinanderlaufen.
 
-# ── Fahrstatus ────────────────────────────────────────────────────────────────
-def update_sailing_status(history, new_hits, prev_compact, today):
-    new_idx = {f"{h.get('trip_date_id')}_{y.get('id')}": True
-               for h in new_hits for y in h.get('yachts', [])}
-    existing_keys = {r['_yacht_key'] for r in history.get('currently_sailing', [])}
+    writes:  {pfad: dict}
+    deletes: [pfad, ...]   (nicht existierende Pfade bitte vorher filtern)
 
-    # Kompakte Einträge auf fahrende Boote prüfen
-    for c in prev_compact:
-        key = c['k']
-        if key not in new_idx and key not in existing_keys:
-            start_iso = c.get('si', '')
-            end_iso   = c.get('ei', '')
-            if start_iso and start_iso <= today and end_iso >= today:
-                history['currently_sailing'].append({
-                    '_yacht_key':    key,
-                    '_start_iso':    start_iso,
-                    '_end_iso':      end_iso,
-                    'Startdatum':    c.get('sd', ''),
-                    'Enddatum':      c.get('ed', ''),
-                    'Reisename':     c.get('rn', ''),
-                    'Typ':           c.get('ty', ''),
-                    'Tage':          c.get('tg', ''),
-                    'Altersgruppe':  c.get('ag', ''),
-                    'Saison':        c.get('sa', ''),
-                    'Preisspanne (€)': c.get('pp', ''),
-                    'Land':          c.get('la', ''),
-                    'Kontinent':     c.get('co', ''),
-                    'Anbieter':      c.get('an', ''),
-                    'Trip ID':       str(c.get('ti', '')),
-                    'Trip Date ID':  str(c.get('tn', '')),
-                    'Skipper':       c.get('sn', '') or '—',
-                    'ID Skipper':    str(c.get('si2', '')),
-                    'Plätze gesamt': c.get('pl', ''),
-                    'Plätze belegt': c.get('po', ''),
-                    'Yacht ID':      str(c.get('yi', '')),
-                    'Yachtmodell':   c.get('ym', ''),
-                    'Yachtname':     c.get('yn', ''),
-                    'Bootstyp':      c.get('yt', ''),
-                    'Baujahr':       c.get('yy', ''),
-                    'Yacht Status':  'Bestätigt',
-                    'Skipper Status': SKIPPER_STATUS_LABELS.get(c.get('sst',''), c.get('sst','') or '—'),
-                    'Flotillenführer': 'Ja' if c.get('sfl') else 'Nein',
-                    'Bewerbungen':   ', '.join(c.get('pr', [])),
-                })
+    Die Contents-API kann das alles nicht (nur eine Datei, und nur < 1 MB) --
+    daher der Blob/Tree/Commit/Ref-Weg, der bis 100 MB traegt.
+    """
+    if not writes and not deletes:
+        return None
 
-    cutoff = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(weeks=4)).strftime('%Y-%m-%d')
-    still, ended = [], []
-    for row in history.get('currently_sailing', []):
-        (ended if row.get('_end_iso','') < today else still).append(row)
-    history['currently_sailing'] = still
+    branch = _gh_default_branch(repo)
 
-    past_keys = {r['_yacht_key'] for r in history.get('past_trips', [])}
-    for row in ended:
-        if row['_yacht_key'] not in past_keys:
-            history['past_trips'].append(row)
-    history['past_trips'] = history.get('past_trips', [])
-    return history
+    ref_url = f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/ref/heads/{branch}"
+    ref = requests.get(ref_url, headers=gh_headers(), timeout=30)
+    ref.raise_for_status()
+    base_commit_sha = ref.json()["object"]["sha"]
 
-# ── Excel bauen (xlsxwriter) ──────────────────────────────────────────────────
-def build_excel(rows, skipper_data, changelog=None, currently_sailing=None, past_trips=None):
-    buf = io.BytesIO()
-    wb  = xlsxwriter.Workbook(buf, {'in_memory': True})
+    commit = requests.get(
+        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/commits/{base_commit_sha}",
+        headers=gh_headers(), timeout=30,
+    )
+    commit.raise_for_status()
+    base_tree_sha = commit.json()["tree"]["sha"]
 
-    # Formate definieren
-    def fmt(bg='FFFFFF', bold=False, center=False, font_color='000000'):
-        return wb.add_format({
-            'font_name':  'Arial',
-            'font_size':  11 if bold else 10,
-            'bold':       bold,
-            'font_color': font_color,
-            'bg_color':   f'#{bg}',
-            'align':      'center' if center else 'left',
-            'valign':     'vcenter',
-            'border':     1,
-            'border_color': '#BFBFBF',
-            'text_wrap':  bold,
+    tree_entries = []
+
+    for path, content in writes.items():
+        payload = json.dumps(content, indent=2, ensure_ascii=False)
+        blob = requests.post(
+            f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/blobs",
+            headers=gh_headers(), timeout=60,
+            json={
+                "content": base64.b64encode(payload.encode("utf-8")).decode("ascii"),
+                "encoding": "base64",
+            },
+        )
+        blob.raise_for_status()
+        tree_entries.append({
+            "path": path, "mode": "100644", "type": "blob",
+            "sha": blob.json()["sha"],
         })
 
-    hdr      = fmt('1F4E79', bold=True, center=True, font_color='FFFFFF')
-    row_a    = fmt('D6E4F0')
-    row_b    = fmt('FFFFFF')
-    no_skip  = fmt('B4F7B4')
-    cancel   = fmt('FFCCCC')
-    unconf   = fmt('FCE4D6')
-    stamm_f  = fmt('C6EFCE')
-    adv_f    = fmt('FFEB9C')
-    hobby_f  = fmt('FFFFFF')
-    cl_chg   = fmt('FFF2CC')
-    cl_new   = fmt('E2EFDA')
-    cl_can   = fmt('FCE4D6')
-    cl_bew   = fmt('D6E4F0')
-    center_a = fmt('D6E4F0', center=True)
-    center_b = fmt('FFFFFF', center=True)
+    for path in deletes:
+        tree_entries.append({
+            "path": path, "mode": "100644", "type": "blob", "sha": None,
+        })
 
-    color_fmt = {'cancel': cancel, 'no_skipper': no_skip, 'unconfirmed': unconf}
+    tree = requests.post(
+        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/trees",
+        headers=gh_headers(), timeout=60,
+        json={"base_tree": base_tree_sha, "tree": tree_entries},
+    )
+    tree.raise_for_status()
+    new_tree_sha = tree.json()["sha"]
 
-    def write_trip_sheet(ws_name, trip_rows, sort_key=None, reverse=False):
-        ws = wb.add_worksheet(ws_name)
-        ws.freeze_panes(1, 0)
-        ws.autofilter(0, 0, 0, len(COLUMN_ORDER)-1)
-        for c, col in enumerate(COLUMN_ORDER):
-            ws.set_column(c, c, COL_WIDTHS.get(col, 14))
-            ws.write(0, c, col, hdr)
-        ws.set_row(0, 32)
+    new_commit = requests.post(
+        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/commits",
+        headers=gh_headers(), timeout=30,
+        json={
+            "message": message,
+            "tree": new_tree_sha,
+            "parents": [base_commit_sha],
+        },
+    )
+    new_commit.raise_for_status()
+    new_commit_sha = new_commit.json()["sha"]
 
-        data = sorted(trip_rows, key=lambda x: x.get(sort_key,''), reverse=reverse) if sort_key else trip_rows
-        for r, row in enumerate(data, 1):
-            cf = color_fmt.get(row.get('_color')) or (row_a if r%2==1 else row_b)
-            for c, col in enumerate(COLUMN_ORDER):
-                ws.write(r, c, row.get(col, ''), cf)
-        return ws
+    # Ohne force: Hat sich die Branch-Spitze bewegt -> 422 -> Retry im Wrapper.
+    upd = requests.patch(
+        f"{GH_API}/repos/{GITHUB_OWNER}/{repo}/git/refs/heads/{branch}",
+        headers=gh_headers(), timeout=30,
+        json={"sha": new_commit_sha, "force": False},
+    )
+    upd.raise_for_status()
+    return upd.json()
 
-    # Segelreisen
-    ws_main = write_trip_sheet('Segelreisen', rows)
-    lc = len(COLUMN_ORDER) + 1
-    ws_main.write(0, lc, 'Legende', fmt('FFFFFF', bold=True))
-    ws_main.set_column(lc, lc, 26)
-    for i, (bg, label) in enumerate([(no_skip,'⚠ Kein Skipper'),(cancel,'🚫 Zu stornieren'),(unconf,'⏳ Nicht bestätigt')], 1):
-        ws_main.write(i, lc, label, bg)
+def gh_update_files_retrying(repo, read_paths, updater_fn, message):
+    """
+    Read-Modify-Write ueber mehrere Dateien, mit Retry bei Schreibkonflikt.
 
-    # Aktuell fahrend
-    write_trip_sheet('Aktuell fahrend', currently_sailing or [], sort_key='_start_iso')
+    updater_fn(existing: {pfad: dict|None}) -> (writes, deletes) | None
+    None bedeutet "nichts zu tun" -> kein leerer Commit.
+    """
+    for attempt in range(3):
+        existing = {}
+        for p in read_paths:
+            content, _ = gh_get_file(repo, p)
+            existing[p] = content
 
-    # Vergangene Törns
-    write_trip_sheet('Vergangene Törns', past_trips or [], sort_key='_end_iso', reverse=True)
+        result = updater_fn(existing)
+        if result is None:
+            return None
+        writes, deletes = result
+        if not writes and not deletes:
+            return None
 
-    # Changelog
-    if changelog is not None:
-        ws_cl = wb.add_worksheet('Changelog')
-        cl_cols = ['Typ','Reisename','Startdatum','Enddatum','Yachtmodell','Yachtname',
-                   'Skipper (neu)','Skipper (alt)','Neue Bewerbungen']
-        cl_widths = [18,28,12,12,22,18,20,20,40]
-        ws_cl.freeze_panes(1, 0)
-        ws_cl.autofilter(0, 0, 0, len(cl_cols)-1)
-        for c, (col, w) in enumerate(zip(cl_cols, cl_widths)):
-            ws_cl.set_column(c, c, w)
-            ws_cl.write(0, c, col, hdr)
-        ws_cl.set_row(0, 32)
-        type_fmt = {'Skipper geändert': cl_chg, 'Neues Boot': cl_new,
-                    'Storniert': cl_can, 'Neue Bewerbung(en)': cl_bew}
-        for r, ch in enumerate(changelog, 1):
-            cf = type_fmt.get(ch.get('typ',''), row_b)
-            vals = [ch.get('typ',''), ch.get('reisename',''), ch.get('startdatum',''),
-                    ch.get('enddatum',''), ch.get('yachtmodell',''), ch.get('yachtname',''),
-                    ch.get('skipper_name',''), ch.get('skipper_alt',''), ch.get('neue_bewerbungen','')]
-            for c, val in enumerate(vals):
-                ws_cl.write(r, c, val, cf)
-
-    # Skipper
-    ws_sk = wb.add_worksheet('Skipper')
-    sk_cols   = ['Skipper','ID','Törns','Wochen','Status']
-    sk_widths = [24,10,8,9,16]
-    ws_sk.freeze_panes(1, 0)
-    ws_sk.autofilter(0, 0, 0, 4)
-    for c, (col, w) in enumerate(zip(sk_cols, sk_widths)):
-        ws_sk.set_column(c, c, w)
-        ws_sk.write(0, c, col, hdr)
-    ws_sk.set_row(0, 32)
-    status_fmt = {'Stammskipper': stamm_f, 'Advanced': adv_f, 'Hobby': hobby_f}
-    for r, (sid, d) in enumerate(skipper_data, 1):
-        status  = 'Stammskipper' if sid in STAMMSKIPPER else ('Advanced' if d['summer_weeks'] > 5 else 'Hobby')
-        def_fmt = row_a if r%2==1 else row_b
-        def_ctr = center_a if r%2==1 else center_b
-        sf      = status_fmt[status]
-        ws_sk.write(r, 0, d['name'],        def_fmt)
-        ws_sk.write(r, 1, sid,              def_ctr)
-        ws_sk.write(r, 2, d['törns'],       def_ctr)
-        ws_sk.write(r, 3, d['total_weeks'], def_ctr)
-        ws_sk.write(r, 4, status,           sf)
-
-    wb.close()
-    buf.seek(0)
-    return buf
-
-# ── E-Mail Benachrichtigung ───────────────────────────────────────────────────
-def send_notification(now_str, termine, yachten, changelog, sailing):
-    if not RESEND_API_KEY:
-        return
-
-    recipients = [m.strip() for m in NOTIFY_EMAILS.split(',') if m.strip()] if NOTIFY_EMAILS else []
-    if not recipients:
-        return
-
-    type_colors = {'Skipper geändert':'#FFF2CC','Neues Boot':'#E2EFDA',
-                   'Storniert':'#FCE4D6','Neue Bewerbung(en)':'#D6E4F0'}
-    th = "padding:8px;text-align:left;border:1px solid #ccc;font-family:Arial;font-size:12px"
-    td = "padding:7px 8px;border:1px solid #ddd;font-family:Arial;font-size:12px"
-
-    if changelog:
-        cl_rows = "".join(f"""<tr style="background:{type_colors.get(ch.get('typ',''),'#fff')}">
-            <td style="{td}">{ch.get('typ','')}</td>
-            <td style="{td}">{ch.get('reisename','')}</td>
-            <td style="{td};white-space:nowrap">{ch.get('startdatum','')}</td>
-            <td style="{td}">{ch.get('yachtmodell','')}</td>
-            <td style="{td}">{ch.get('skipper_name','') or '—'}</td>
-            <td style="{td}">{ch.get('skipper_alt','')}</td>
-            <td style="{td}">{ch.get('neue_bewerbungen','')}</td>
-            </tr>""" for ch in changelog)
-        changelog_html = f"""
-        <h2 style="color:#1F4E79;font-family:Arial;font-size:14px;margin-top:20px">
-            Changelog ({len(changelog)} Änderungen)</h2>
-        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch">
-        <table style="border-collapse:collapse;width:100%;min-width:480px;font-family:Arial">
-          <tr style="background:#1F4E79;color:#fff">
-            <th style="{th}">Typ</th><th style="{th}">Reise</th><th style="{th}">Start</th>
-            <th style="{th}">Yacht</th><th style="{th}">Skipper neu</th>
-            <th style="{th}">Skipper alt</th><th style="{th}">Neue Bewerbungen</th>
-          </tr>{cl_rows}
-        </table></div>"""
-    else:
-        changelog_html = '<p style="font-family:Arial;color:#5a7399;font-size:13px">Keine Änderungen seit gestern.</p>'
-
-    def stat(val, label):
-        return f"""<div style="background:#fff;border:1px solid #d0dff0;border-radius:8px;
-            padding:10px 6px;flex:1;text-align:center;min-width:55px">
-            <div style="font-size:20px;font-weight:bold;color:#3b82f6;font-family:Arial">{val}</div>
-            <div style="font-size:10px;color:#5a7399;font-family:Arial;text-transform:uppercase;margin-top:3px">{label}</div>
-            </div>"""
-
-    html = f"""<!DOCTYPE html><html><body style="margin:0;padding:12px;background:#e8edf5;font-family:Arial">
-    <div style="max-width:600px;margin:0 auto;background:#f5f8ff;padding:16px;border-radius:12px">
-      <div style="background:#1F4E79;border-radius:8px;padding:12px 16px;margin-bottom:14px">
-        <span style="font-size:18px">⛵</span>
-        <span style="font-size:15px;font-weight:bold;color:#fff;margin-left:8px">Skipperplan – Tagesupdate</span>
-      </div>
-      <p style="color:#5a7399;font-size:12px;margin-bottom:14px">
-        Aktualisiert: <strong style="color:#1F4E79">{now_str}</strong></p>
-      <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
-        {stat(termine,'Termine')}{stat(yachten,'Yachten')}{stat(sailing,'Fahrend')}{stat(len(changelog),'Änderungen')}
-      </div>
-      {changelog_html}
-      <p style="font-size:11px;color:#aaa;margin-top:16px">Skipperplan · Flotilla Management</p>
-    </div></body></html>"""
-
-    try:
-        requests.post(
-            "https://api.resend.com/emails",
-            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "from":    "Skipperplan <onboarding@resend.dev>",
-                "to":      recipients,
-                "subject": f"⛵ Skipperplan Update – {now_str}",
-                "html":    html,
-            },
-            timeout=15,
-        )
-    except Exception as e:
-        print(f"[mail error] {e}")
-
-
-# ── Endpunkte ─────────────────────────────────────────────────────────────────
-def check_password():
-    return not APP_PASSWORD or request.args.get("password","") == APP_PASSWORD
-
-@app.route("/check", methods=["GET"])
-def check():
-    return (jsonify({"ok": True}) if check_password() else (jsonify({"ok": False}), 401))
-
-@app.route("/refresh", methods=["GET"])
-def refresh():
-    """Synchroner Endpunkt – für manuelle Aktualisierung über die Webseite."""
-    source  = request.args.get("source", "manual")
-    try:
-        now_str  = datetime.datetime.now(datetime.UTC).strftime('%d.%m.%Y %H:%M UTC')
-        today    = today_iso()
-        api_key  = login()
-        new_hits = fetch_algolia(api_key)
-        history  = load_history()
-        prev_compact = history.get("daily_hits", [])
-        changelog = detect_changes(new_hits, prev_compact, today) if prev_compact else []
-        history   = update_sailing_status(history, new_hits, prev_compact, today)
-        if source == "daily" or not prev_compact:
-            history["daily_hits"] = compact_hits(new_hits)
-        rows         = extract_rows(new_hits)
-        skipper_data = build_skipper_data(new_hits)
-        buf          = build_excel(rows, skipper_data, changelog,
-                                   history['currently_sailing'], history['past_trips'])
-        excel_bytes  = buf.read()
-        save_history(history, f"History: {now_str}")
-        _, sha_main = gh_get_file("skipperplan.xlsx")
-        gh_put_file("skipperplan.xlsx", excel_bytes, sha_main, f"Skipperplan: {now_str}")
-        if source == "daily":
-            _, sha_daily = gh_get_file("skipperplan_daily.xlsx")
-            gh_put_file("skipperplan_daily.xlsx", excel_bytes, sha_daily, f"Täglich: {now_str}")
-            send_notification(now_str, len(new_hits), len(rows), changelog,
-                              len(history['currently_sailing']))
-        return jsonify({"ok": True, "updated": now_str,
-                        "termine": len(new_hits), "yachten": len(rows),
-                        "changes": len(changelog), "sailing": len(history['currently_sailing'])})
-    except Exception as e:
-        import traceback
-        return jsonify({"error": str(e), "trace": traceback.format_exc()[-800:]}), 500
-
-
-@app.route("/refresh-async", methods=["GET"])
-def refresh_async():
-    """Asynchroner Endpunkt – für cron-job.org (antwortet sofort, arbeitet im Hintergrund)."""
-    import threading
-
-    def do_refresh():
         try:
-            now_str  = datetime.datetime.now(datetime.UTC).strftime('%d.%m.%Y %H:%M UTC')
-            today    = today_iso()
-            api_key  = login()
-            new_hits = fetch_algolia(api_key)
-            history  = load_history()
-            prev_compact = history.get("daily_hits", [])
-            changelog = detect_changes(new_hits, prev_compact, today) if prev_compact else []
-            history   = update_sailing_status(history, new_hits, prev_compact, today)
-            history["daily_hits"] = compact_hits(new_hits)
-            rows         = extract_rows(new_hits)
-            skipper_data = build_skipper_data(new_hits)
-            buf          = build_excel(rows, skipper_data, changelog,
-                                       history['currently_sailing'], history['past_trips'])
-            excel_bytes  = buf.read()
-            save_history(history, f"History: {now_str}")
-            _, sha_main = gh_get_file("skipperplan.xlsx")
-            gh_put_file("skipperplan.xlsx", excel_bytes, sha_main, f"Skipperplan: {now_str}")
-            _, sha_daily = gh_get_file("skipperplan_daily.xlsx")
-            gh_put_file("skipperplan_daily.xlsx", excel_bytes, sha_daily, f"Täglich: {now_str}")
-            send_notification(now_str, len(new_hits), len(rows), changelog,
-                              len(history['currently_sailing']))
+            gh_commit_files(repo, writes, deletes, message)
+            return writes
+        except requests.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status in (409, 422) and attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            raise
+
+def gh_put_file(repo, path, content_dict, message):
+    """Einzeldatei -- duenner Wrapper um gh_commit_files."""
+    return gh_commit_files(repo, {path: content_dict}, [], message)
+
+# ============================================================================
+# Skipper-Register
+# ============================================================================
+
+def _load_skippers():
+    existing, _ = gh_get_file(ADMIN_REPO, "skippers.json")
+    return existing or {"skippers": []}
+
+def _find_skipper(skippers_data, token):
+    for s in skippers_data.get("skippers", []):
+        if s.get("token") == token:
+            return s
+    return None
+
+def auth_skipper():
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header[7:]
+    if token in LEGACY_TOKENS:
+        return (LEGACY_TOKENS[token], token)
+    try:
+        skippers_data = _load_skippers()
+    except Exception:
+        return None
+    found = _find_skipper(skippers_data, token)
+    if found:
+        _maybe_update_last_seen(token)
+        return (found.get("name", "Unbekannt"), token)
+    return None
+
+def auth_admin():
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return False
+    return ADMIN_TOKEN and auth_header[7:] == ADMIN_TOKEN
+
+def _maybe_update_last_seen(token):
+    now = time.time()
+    last = _last_seen_debounce.get(token, 0)
+    if now - last < LAST_SEEN_THROTTLE_SEC:
+        return
+    _last_seen_debounce[token] = now
+
+    def update(existing):
+        data = existing["skippers.json"] or {"skippers": []}
+        for s in data.get("skippers", []):
+            if s.get("token") == token:
+                s["last_seen_at"] = now_iso()
+                break
+        return {"skippers.json": data}, []
+
+    try:
+        gh_update_files_retrying(
+            ADMIN_REPO, ["skippers.json"], update, f"last_seen: {token[:8]}..."
+        )
+    except Exception:
+        pass
+
+# ============================================================================
+# Skipper-Endpoints
+# ============================================================================
+
+@app.route("/skippers/new", methods=["POST"])
+def new_skipper():
+    token = generate_skipper_token()
+
+    def update(existing):
+        data = existing["skippers.json"] or {"skippers": []}
+        if any(s.get("token") == token for s in data["skippers"]):
+            raise ValueError("collision")
+        data["skippers"].append({
+            "token": token,
+            "name": f"Skipper-{token[:6]}",
+            "created_at": now_iso(),
+            "last_seen_at": now_iso(),
+        })
+        return {"skippers.json": data}, []
+
+    gh_update_files_retrying(
+        ADMIN_REPO, ["skippers.json"], update, f"skipper new: {token[:8]}..."
+    )
+    return jsonify({"token": token, "name": f"Skipper-{token[:6]}"})
+
+@app.route("/whoami", methods=["GET"])
+def whoami():
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    name, _ = skipper
+    return jsonify({"name": name})
+
+# ============================================================================
+# Admin-Index
+# ============================================================================
+
+@app.route("/admin/skippers", methods=["GET"])
+def admin_list_skippers():
+    if not auth_admin():
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify(_load_skippers())
+
+@app.route("/admin/skippers/<token>", methods=["PATCH"])
+def admin_patch_skipper(token):
+    if not auth_admin():
+        return jsonify({"error": "unauthorized"}), 401
+    body = request.get_json(force=True, silent=True) or {}
+    new_name = body.get("name", "").strip()
+    if not new_name:
+        return jsonify({"error": "name required"}), 400
+
+    def update(existing):
+        data = existing["skippers.json"] or {"skippers": []}
+        for s in data.get("skippers", []):
+            if s.get("token") == token:
+                s["name"] = new_name
+                return {"skippers.json": data}, []
+        raise ValueError("skipper not found")
+
+    try:
+        gh_update_files_retrying(
+            ADMIN_REPO, ["skippers.json"], update, f"admin: rename {token[:8]}"
+        )
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    return jsonify({"token": token, "name": new_name})
+
+def admin_index_upsert(entry):
+    def update(existing):
+        data = existing["index.json"] or {"tracks": []}
+        for i, t in enumerate(data["tracks"]):
+            if t["id"] == entry["id"]:
+                data["tracks"][i] = {**t, **entry}
+                break
+        else:
+            data["tracks"].append(entry)
+        return {"index.json": data}, []
+
+    gh_update_files_retrying(
+        ADMIN_REPO, ["index.json"], update, f"admin: upsert {entry['id']}"
+    )
+
+def admin_index_remove(track_id):
+    def update(existing):
+        data = existing["index.json"]
+        if not data or "tracks" not in data:
+            return None
+        before = len(data["tracks"])
+        data["tracks"] = [t for t in data["tracks"] if t.get("id") != track_id]
+        if len(data["tracks"]) == before:
+            return None
+        return {"index.json": data}, []
+
+    gh_update_files_retrying(
+        ADMIN_REPO, ["index.json"], update, f"admin: remove {track_id}"
+    )
+
+# ============================================================================
+# Track-Struktur (v3)
+# ============================================================================
+
+def empty_manifest(track_id, name, boat, skipper, trip_start=None, trip_end=None):
+    """
+    Das Manifest ist die einzige Datei, die das Frontend ueber den Code direkt
+    findet. Es traegt die Toern-Meta und den Segment-Index -- aber KEINE Punkte.
+
+    Jeder Segment-Eintrag haelt `point_count` und `ts_hash` redundant zur
+    Segmentdatei. Das ist Absicht: GET /digest wird damit zu EINEM kleinen
+    Dateizugriff statt zu einem Vollscan ueber alle Segmente.
+    """
+    return {
+        "version": 3,
+        "type": "TrackManifest",
+        "properties": {
+            "id": track_id,
+            "name": name,
+            "boat": boat,
+            "skipper": skipper,
+            "trip_start": trip_start,
+            "trip_end": trip_end,
+            "status": "active",
+            "created_at": now_iso(),
+            "stats": {
+                "distance_total_nm": 0.0,
+                "point_count": 0,
+                "segment_count": 0,
+            },
+        },
+        "segments": [],
+    }
+
+def empty_segment(track_id, seg, anchor=None):
+    """
+    Eine Segmentdatei ist ein eigenstaendiges GeoJSON -- bewusst so, damit das
+    Frontend sie ohne Umbau rendern und ein Nutzer sie einzeln herunterladen
+    kann.
+
+    `anchor` dokumentiert, WORAUF sich die Zeitstempel dieses Segments
+    beziehen: welcher Wall-Clock-Wert beim Verankern galt, auf welchem Boot,
+    und ob dabei ein Uhrsprung erkannt wurde. Genau diese Information hat beim
+    Ibiza-Toern gefehlt -- die Rekonstruktion des +3557-s-Versatzes musste
+    muehsam aus 67.000 Punkten erfolgen.
+    """
+    return {
+        "type": "FeatureCollection",
+        "properties": {
+            "version": 3,
+            "track_id": track_id,
+            "segment": seg,
+            "opened_at": now_iso(),
+            "closed_at": None,
+            "anchor": anchor or {},
+            "stats": {
+                "distance_nm": 0.0,
+                "point_count": 0,
+                "t_start": None,
+                "t_stop": None,
+            },
+        },
+        "features": [{
+            "type": "Feature",
+            "geometry": {"type": "LineString", "coordinates": []},
+            "properties": {"timestamps": []},
+        }],
+    }
+
+def recalc_segment(seg_doc):
+    """Distanz, Punktzahl, t-Bereich und Hash EINES Segments neu rechnen.
+
+    Kein Pausen-Sonderfall mehr: Ein Segment ist per Definition eine
+    ununterbrochene Aufnahme. Wo frueher eine Pause lag, endet heute die Datei.
+    """
+    feat = seg_doc["features"][0]
+    coords = feat["geometry"]["coordinates"]
+    timestamps = feat["properties"]["timestamps"]
+
+    total_nm = 0.0
+    for j in range(1, len(coords)):
+        lon1, lat1 = coords[j-1]
+        lon2, lat2 = coords[j]
+        total_nm += haversine_nm(lat1, lon1, lat2, lon2)
+
+    stats = {
+        "distance_nm": round(total_nm, 3),
+        "point_count": len(coords),
+        "t_start": timestamps[0] if timestamps else None,
+        "t_stop": timestamps[-1] if timestamps else None,
+    }
+    seg_doc["properties"]["stats"] = stats
+    return stats
+
+def segment_entry(seg_doc):
+    """Der Eintrag, wie er im Manifest steht."""
+    p = seg_doc["properties"]
+    st = p["stats"]
+    ts = seg_doc["features"][0]["properties"]["timestamps"]
+    return {
+        "id": p["segment"],
+        "file": f"{{hash}}-{p['segment']}.geojson",  # wird unten ersetzt
+        "t_start": st["t_start"],
+        "t_stop": st["t_stop"],
+        "point_count": st["point_count"],
+        "distance_nm": st["distance_nm"],
+        "ts_hash": ts_hash(ts),
+        "anchor": p.get("anchor", {}),
+        "opened_at": p.get("opened_at"),
+        "closed_at": p.get("closed_at"),
+        "closed": p.get("closed_at") is not None,
+    }
+
+def manifest_put_segment(manifest, file_hash, seg_doc):
+    """Segment-Eintrag im Manifest ersetzen/anlegen und Aggregate neu rechnen."""
+    entry = segment_entry(seg_doc)
+    entry["file"] = f"{file_hash}-{entry['id']}.geojson"
+
+    segs = manifest.setdefault("segments", [])
+    for i, s in enumerate(segs):
+        if s["id"] == entry["id"]:
+            segs[i] = entry
+            break
+    else:
+        segs.append(entry)
+    segs.sort(key=lambda s: s["id"])
+
+    refresh_manifest_stats(manifest)
+    return manifest
+
+def refresh_manifest_stats(manifest):
+    """
+    Aggregate + Konfliktmarkierung.
+
+    `conflict` heisst: Der t-Bereich dieses Segments ueberlappt den eines
+    anderen. Das ist KEIN Datenschaden (die Dateien sind getrennt, es wird nie
+    ueber Segmentgrenzen sortiert), sondern ein Hinweis, dass mindestens einer
+    der beiden Anker daneben lag. Die App zeigt das an; korrigiert wird per
+    /shift, in Ruhe, im Nachhinein.
+    """
+    segs = manifest.get("segments", [])
+
+    total_nm = sum(s.get("distance_nm") or 0.0 for s in segs)
+    total_pts = sum(s.get("point_count") or 0 for s in segs)
+
+    for s in segs:
+        s["conflict"] = False
+    for i, a in enumerate(segs):
+        if a["t_start"] is None or a["t_stop"] is None:
+            continue
+        for b in segs[i+1:]:
+            if b["t_start"] is None or b["t_stop"] is None:
+                continue
+            if a["t_start"] <= b["t_stop"] and b["t_start"] <= a["t_stop"]:
+                a["conflict"] = True
+                b["conflict"] = True
+
+    manifest["properties"]["stats"] = {
+        "distance_total_nm": round(total_nm, 3),
+        "point_count": total_pts,
+        "segment_count": len(segs),
+    }
+    return manifest
+
+def check_owner(manifest, skipper_name):
+    if manifest is None:
+        raise LookupError("track not found")
+    if manifest["properties"].get("skipper") != skipper_name:
+        raise PermissionError("not owner")
+
+# ============================================================================
+# Track-Endpoints
+# ============================================================================
+
+@app.route("/")
+def root():
+    return jsonify({
+        "service": "sailtrack-backend",
+        "status": "ok",
+        "version": 3,
+        "model": "segment-split",
+    })
+
+@app.route("/tracks", methods=["POST"])
+def create_track():
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    skipper_name, _ = skipper
+    body = request.get_json(force=True, silent=True) or {}
+    name = body.get("name", "").strip() or "Unbenannter Track"
+    boat = body.get("boat", "").strip() or "–"
+    trip_start = body.get("trip_start")
+    trip_end = body.get("trip_end")
+
+    code = generate_code()
+    file_hash = hash_code(code)
+    manifest = empty_manifest(code, name, boat, skipper_name, trip_start, trip_end)
+
+    gh_put_file(DATA_REPO, manifest_path(file_hash), manifest,
+                f"create track {file_hash[:8]}")
+    admin_index_upsert({
+        "id": code, "code": code, "file_hash": file_hash,
+        "name": name, "boat": boat, "skipper": skipper_name,
+        "trip_start": trip_start, "trip_end": trip_end,
+        "status": "active", "created_at": manifest["properties"]["created_at"],
+    })
+    return jsonify({"id": code, "code": code, "file_hash": file_hash})
+
+@app.route("/tracks/<track_id>", methods=["PATCH"])
+def patch_track(track_id):
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    skipper_name, _ = skipper
+    body = request.get_json(force=True, silent=True) or {}
+    allowed = {"name", "boat", "trip_start", "trip_end"}
+    updates = {k: v for k, v in body.items() if k in allowed}
+    if not updates:
+        return jsonify({"error": "no valid fields"}), 400
+
+    file_hash = hash_code(track_id)
+    mpath = manifest_path(file_hash)
+
+    def update(existing):
+        m = existing[mpath]
+        check_owner(m, skipper_name)
+        for k, v in updates.items():
+            m["properties"][k] = v
+        return {mpath: m}, []
+
+    try:
+        gh_update_files_retrying(
+            DATA_REPO, [mpath], update,
+            f"patch {file_hash[:8]}: {','.join(updates.keys())}"
+        )
+    except LookupError as e:
+        return jsonify({"error": str(e)}), 404
+    except PermissionError as e:
+        return jsonify({"error": str(e)}), 403
+
+    admin_index_upsert({"id": track_id, **updates})
+    return jsonify({"id": track_id, **updates})
+
+# ============================================================================
+# Segmente
+# ============================================================================
+
+@app.route("/tracks/<track_id>/segments", methods=["POST"])
+def open_segment(track_id):
+    """
+    Oeffnet ein Segment. Body: {seg: "s001", anchor: {...}}
+
+    Idempotent: Existiert das Segment schon, ist das ein Erfolg -- die App darf
+    den Aufruf nach einem unklaren Fehlschlag gefahrlos wiederholen. Der Anker
+    wird dabei NICHT ueberschrieben; er gehoert dem Segment und aendert sich nur
+    ueber /shift.
+    """
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    skipper_name, _ = skipper
+
+    body = request.get_json(force=True, silent=True) or {}
+    seg = (body.get("seg") or "").strip()
+    if not SEG_RE.match(seg):
+        return jsonify({"error": "seg must look like s001"}), 400
+    anchor = body.get("anchor") or {}
+
+    file_hash = hash_code(track_id)
+    mpath = manifest_path(file_hash)
+    spath = segment_path(file_hash, seg)
+
+    def update(existing):
+        m = existing[mpath]
+        check_owner(m, skipper_name)
+        s = existing[spath]
+        if s is not None:
+            return None  # schon da -> nichts zu tun
+        s = empty_segment(track_id, seg, anchor)
+        recalc_segment(s)
+        manifest_put_segment(m, file_hash, s)
+        return {spath: s, mpath: m}, []
+
+    try:
+        gh_update_files_retrying(
+            DATA_REPO, [mpath, spath], update,
+            f"open segment {seg} on {file_hash[:8]}"
+        )
+    except LookupError as e:
+        return jsonify({"error": str(e)}), 404
+    except PermissionError as e:
+        return jsonify({"error": str(e)}), 403
+
+    return jsonify({"seg": seg, "file": f"{file_hash}-{seg}.geojson"})
+
+@app.route("/tracks/<track_id>/segments/<seg>/points", methods=["POST"])
+def append_points(track_id, seg):
+    """
+    Body: {points: [{t, lat, lon}, ...]}
+
+    Dubletten werden uebersprungen -- INNERHALB dieses Segments. Sendet die App
+    nach einem unklaren Fehlschlag denselben Schwung erneut, passiert nichts
+    Doppeltes. Dass dieselbe Sekunde in einem ANDEREN Segment vorkommt, ist
+    dagegen voellig in Ordnung und wird hier nicht geprueft: Ab v3 ist die
+    Punkt-Identitaet (track, segment, t).
+    """
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    skipper_name, _ = skipper
+
+    if not SEG_RE.match(seg):
+        return jsonify({"error": "bad seg"}), 400
+
+    body = request.get_json(force=True, silent=True) or {}
+    points = body.get("points", [])
+    if not points:
+        return jsonify({"accepted": 0, "duplicates": 0})
+    points = sorted(points, key=lambda p: p["t"])
+
+    file_hash = hash_code(track_id)
+    mpath = manifest_path(file_hash)
+    spath = segment_path(file_hash, seg)
+
+    result = {"accepted": 0, "duplicates": 0}
+
+    def update(existing):
+        m = existing[mpath]
+        check_owner(m, skipper_name)
+        s = existing[spath]
+        if s is None:
+            raise LookupError("segment not found")
+
+        feat = s["features"][0]
+        coords = feat["geometry"]["coordinates"]
+        timestamps = feat["properties"]["timestamps"]
+        seen = set(timestamps)
+
+        accepted = 0
+        duplicates = 0
+        for p in points:
+            t, lat, lon = int(p["t"]), p["lat"], p["lon"]
+            if t in seen:
+                duplicates += 1
+                continue
+            seen.add(t)
+            if not timestamps or t >= timestamps[-1]:
+                timestamps.append(t)
+                coords.append([lon, lat])
+            else:
+                idx = bisect.bisect_left(timestamps, t)
+                timestamps.insert(idx, t)
+                coords.insert(idx, [lon, lat])
+            accepted += 1
+
+        result["accepted"] = accepted
+        result["duplicates"] = duplicates
+        if accepted == 0:
+            return None
+
+        recalc_segment(s)
+        manifest_put_segment(m, file_hash, s)
+        return {spath: s, mpath: m}, []
+
+    try:
+        gh_update_files_retrying(
+            DATA_REPO, [mpath, spath], update,
+            f"append {len(points)} pts to {file_hash[:8]}/{seg}"
+        )
+    except LookupError as e:
+        return jsonify({"error": str(e)}), 404
+    except PermissionError as e:
+        return jsonify({"error": str(e)}), 403
+
+    return jsonify(result)
+
+@app.route("/tracks/<track_id>/segments/<seg>/close", methods=["POST"])
+def close_segment(track_id, seg):
+    """Segment schliessen. Danach kommen keine Punkte mehr dazu.
+
+    Nicht erzwungen -- der Server bleibt dumm. Es ist eine Markierung fuer die
+    App und das Frontend, kein Schreibschutz.
+    """
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    skipper_name, _ = skipper
+    if not SEG_RE.match(seg):
+        return jsonify({"error": "bad seg"}), 400
+
+    file_hash = hash_code(track_id)
+    mpath = manifest_path(file_hash)
+    spath = segment_path(file_hash, seg)
+
+    def update(existing):
+        m = existing[mpath]
+        check_owner(m, skipper_name)
+        s = existing[spath]
+        if s is None:
+            raise LookupError("segment not found")
+        if s["properties"].get("closed_at"):
+            return None
+        s["properties"]["closed_at"] = now_iso()
+        recalc_segment(s)
+        manifest_put_segment(m, file_hash, s)
+        return {spath: s, mpath: m}, []
+
+    try:
+        gh_update_files_retrying(
+            DATA_REPO, [mpath, spath], update,
+            f"close segment {seg} on {file_hash[:8]}"
+        )
+    except LookupError as e:
+        return jsonify({"error": str(e)}), 404
+    except PermissionError as e:
+        return jsonify({"error": str(e)}), 403
+
+    return jsonify({"seg": seg, "closed": True})
+
+@app.route("/tracks/<track_id>/segments/<seg>/shift", methods=["POST"])
+def shift_segment(track_id, seg):
+    """
+    Verschiebt ALLE Zeitstempel eines Segments um `delta` Sekunden.
+    Body: {delta: -3557}
+
+    Das ist die Reparatur fuer einen falschen Anker (Reboot mitten im Toern,
+    Systemuhr stand daneben). Weil alle Stempel um denselben Betrag wandern,
+    bleibt die Reihenfolge erhalten -- es muss nichts umsortiert werden, und es
+    kann innerhalb des Segments keine Dublette entstehen.
+
+    Eine Ueberlappung mit einem anderen Segment ist ausdruecklich ERLAUBT und
+    wird nur als `conflict` markiert. Getrennte Dateien, keine gemeinsame
+    Sortierung -- das ist der ganze Sinn des Splits.
+
+    Der Anker der Datei wandert mit, sonst wuerde ein spaeteres Fortsetzen der
+    Aufnahme wieder auf die alte Zeitbasis zurueckfallen.
+    """
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    skipper_name, _ = skipper
+    if not SEG_RE.match(seg):
+        return jsonify({"error": "bad seg"}), 400
+
+    body = request.get_json(force=True, silent=True) or {}
+    delta = body.get("delta")
+    if not isinstance(delta, int) or delta == 0:
+        return jsonify({"error": "delta must be a non-zero int (seconds)"}), 400
+
+    file_hash = hash_code(track_id)
+    mpath = manifest_path(file_hash)
+    spath = segment_path(file_hash, seg)
+
+    def update(existing):
+        m = existing[mpath]
+        check_owner(m, skipper_name)
+        s = existing[spath]
+        if s is None:
+            raise LookupError("segment not found")
+
+        feat = s["features"][0]
+        feat["properties"]["timestamps"] = [
+            int(t) + delta for t in feat["properties"]["timestamps"]
+        ]
+
+        anchor = s["properties"].setdefault("anchor", {})
+        if isinstance(anchor.get("wall_anchor_ms"), int):
+            anchor["wall_anchor_ms"] += delta * 1000
+        hist = anchor.setdefault("shifts", [])
+        hist.append({"delta": delta, "at": now_iso()})
+
+        recalc_segment(s)
+        manifest_put_segment(m, file_hash, s)
+        return {spath: s, mpath: m}, []
+
+    try:
+        gh_update_files_retrying(
+            DATA_REPO, [mpath, spath], update,
+            f"shift {seg} by {delta}s on {file_hash[:8]}"
+        )
+    except LookupError as e:
+        return jsonify({"error": str(e)}), 404
+    except PermissionError as e:
+        return jsonify({"error": str(e)}), 403
+
+    m, _ = gh_get_file(DATA_REPO, mpath)
+    entry = next((x for x in m["segments"] if x["id"] == seg), None)
+    return jsonify({"seg": seg, "delta": delta, "segment": entry})
+
+# ============================================================================
+# Status
+# ============================================================================
+
+def _set_status(track_id, new_status, skipper_name):
+    file_hash = hash_code(track_id)
+    mpath = manifest_path(file_hash)
+
+    def update(existing):
+        m = existing[mpath]
+        check_owner(m, skipper_name)
+        m["properties"]["status"] = new_status
+        if new_status == "finished":
+            m["properties"]["finished_at"] = now_iso()
+        else:
+            m["properties"].pop("finished_at", None)
+        return {mpath: m}, []
+
+    written = gh_update_files_retrying(
+        DATA_REPO, [mpath], update, f"status->{new_status} {file_hash[:8]}"
+    )
+    admin_index_upsert({"id": track_id, "status": new_status})
+    return written[mpath] if written else None
+
+@app.route("/tracks/<track_id>/finish", methods=["POST"])
+def finish_track(track_id):
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    skipper_name, _ = skipper
+    try:
+        m = _set_status(track_id, "finished", skipper_name)
+    except LookupError as e:
+        return jsonify({"error": str(e)}), 404
+    except PermissionError as e:
+        return jsonify({"error": str(e)}), 403
+    return jsonify({"status": "finished",
+                    "stats": m["properties"]["stats"] if m else None})
+
+@app.route("/tracks/<track_id>/reopen", methods=["POST"])
+def reopen_track(track_id):
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    skipper_name, _ = skipper
+    try:
+        m = _set_status(track_id, "active", skipper_name)
+    except LookupError as e:
+        return jsonify({"error": str(e)}), 404
+    except PermissionError as e:
+        return jsonify({"error": str(e)}), 403
+    return jsonify({"status": "active",
+                    "stats": m["properties"]["stats"] if m else None})
+
+# ============================================================================
+# Lesen
+# ============================================================================
+
+@app.route("/tracks", methods=["GET"])
+def list_my_tracks():
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    skipper_name, _ = skipper
+    existing, _ = gh_get_file(ADMIN_REPO, "index.json")
+    if not existing:
+        return jsonify([])
+    mine = [
+        {k: v for k, v in t.items() if k != "code"}
+        for t in existing["tracks"]
+        if t.get("skipper") == skipper_name
+    ]
+    return jsonify(mine)
+
+@app.route("/tracks/<track_id>", methods=["GET"])
+def get_track(track_id):
+    """Nur das Manifest -- klein, ohne Punkte."""
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    skipper_name, _ = skipper
+    m, _ = gh_get_file(DATA_REPO, manifest_path(hash_code(track_id)))
+    try:
+        check_owner(m, skipper_name)
+    except LookupError:
+        return jsonify({"error": "track not found"}), 404
+    except PermissionError:
+        return jsonify({"error": "not owner"}), 403
+    return jsonify(m)
+
+@app.route("/tracks/<track_id>/segments/<seg>", methods=["GET"])
+def get_segment(track_id, seg):
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    skipper_name, _ = skipper
+    if not SEG_RE.match(seg):
+        return jsonify({"error": "bad seg"}), 400
+
+    file_hash = hash_code(track_id)
+    m, _ = gh_get_file(DATA_REPO, manifest_path(file_hash))
+    try:
+        check_owner(m, skipper_name)
+    except LookupError:
+        return jsonify({"error": "track not found"}), 404
+    except PermissionError:
+        return jsonify({"error": "not owner"}), 403
+
+    s, _ = gh_get_file(DATA_REPO, segment_path(file_hash, seg))
+    if s is None:
+        return jsonify({"error": "segment not found"}), 404
+    return jsonify(s)
+
+@app.route("/tracks/<track_id>/digest", methods=["GET"])
+def get_track_digest(track_id):
+    """
+    Fingerabdruck PRO SEGMENT -- aus dem Manifest, ohne die Segmentdateien
+    anzufassen. Ein Dateizugriff, ein paar hundert Bytes.
+
+    Die App vergleicht das vor "Daten vom Geraet entfernen": Stimmen fuer jedes
+    Segment point_count UND ts_hash mit dem lokalen Bestand, ist Loeschen sicher.
+    """
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    skipper_name, _ = skipper
+
+    m, _ = gh_get_file(DATA_REPO, manifest_path(hash_code(track_id)))
+    try:
+        check_owner(m, skipper_name)
+    except LookupError:
+        return jsonify({"error": "track not found"}), 404
+    except PermissionError:
+        return jsonify({"error": "not owner"}), 403
+
+    segs = [{
+        "id": s["id"],
+        "point_count": s["point_count"],
+        "last_t": s["t_stop"],
+        "ts_hash": s["ts_hash"],
+        "closed": s.get("closed", False),
+        "conflict": s.get("conflict", False),
+    } for s in m.get("segments", [])]
+
+    return jsonify({
+        "segments": segs,
+        "point_count": m["properties"]["stats"]["point_count"],
+        "segment_count": len(segs),
+    })
+
+@app.route("/tracks/<track_id>", methods=["DELETE"])
+def delete_track(track_id):
+    """Manifest + alle Segmentdateien, in einem Commit. Idempotent."""
+    skipper = auth_skipper()
+    if not skipper:
+        return jsonify({"error": "unauthorized"}), 401
+    skipper_name, _ = skipper
+
+    file_hash = hash_code(track_id)
+    m, _ = gh_get_file(DATA_REPO, manifest_path(file_hash))
+    if m is None:
+        admin_index_remove(track_id)
+        return jsonify({"deleted": True, "already_gone": True})
+    if m["properties"].get("skipper") != skipper_name:
+        return jsonify({"error": "not owner"}), 403
+
+    paths = gh_list_dir(DATA_REPO, track_dir(file_hash))
+    if paths:
+        gh_commit_files(DATA_REPO, {}, paths, f"delete track {file_hash[:8]}")
+    admin_index_remove(track_id)
+    return jsonify({"deleted": True, "files": len(paths)})
+
+# ============================================================================
+# Migration v2 -> v3
+# ============================================================================
+
+def split_v2_at_pauses(coords, timestamps, pauses):
+    """
+    Zerlegt den flachen v2-LineString an den Pausen.
+
+    Identisch zur Logik, die das alte Frontend (track.html) benutzt hat --
+    absichtlich, damit die Migration genau die Segmente erzeugt, die man dort
+    schon gesehen hat. Pausen entstanden beim stopTracking, ein Abschnitt
+    zwischen zwei Pausen ist also genau eine Aufnahme.
+    """
+    pauses_sorted = sorted(pauses or [])
+    out = []
+    cur_c, cur_t = [], []
+    pi = 0
+    for i, t in enumerate(timestamps):
+        while pi < len(pauses_sorted) and pauses_sorted[pi] < t:
+            if cur_c:
+                out.append((cur_c, cur_t))
+                cur_c, cur_t = [], []
+            pi += 1
+        cur_c.append(coords[i])
+        cur_t.append(int(t))
+    if cur_c:
+        out.append((cur_c, cur_t))
+    return out
+
+def migrate_one(track_id, dry_run=False):
+    """Einen v2-Track ins v3-Layout ueberfuehren. Gibt eine Zusammenfassung."""
+    file_hash = hash_code(track_id)
+    old, _ = gh_get_file(DATA_REPO, legacy_path(file_hash))
+    if old is None:
+        return {"id": track_id, "skipped": "no v2 file"}
+
+    props = old["properties"]
+    feat = old["features"][0]
+    coords = feat["geometry"]["coordinates"]
+    timestamps = feat["properties"].get("timestamps", [])
+    pauses = props.get("pauses", [])
+
+    parts = split_v2_at_pauses(coords, timestamps, pauses)
+
+    manifest = empty_manifest(
+        track_id, props.get("name", ""), props.get("boat", "–"),
+        props.get("skipper", ""), props.get("trip_start"), props.get("trip_end"),
+    )
+    manifest["properties"]["status"] = props.get("status", "active")
+    manifest["properties"]["created_at"] = props.get("created_at", now_iso())
+    if props.get("finished_at"):
+        manifest["properties"]["finished_at"] = props["finished_at"]
+    manifest["properties"]["migrated_from"] = "v2"
+
+    writes = {}
+    for i, (c, t) in enumerate(parts, start=1):
+        seg = f"s{i:03d}"
+        s = empty_segment(track_id, seg, anchor={
+            # Der Anker ist fuer Alt-Toerns unbekannt -- es gab ihn nie.
+            # Ehrlich als null markieren statt etwas zu erfinden.
+            "known": False,
+            "migrated": True,
+        })
+        s["features"][0]["geometry"]["coordinates"] = c
+        s["features"][0]["properties"]["timestamps"] = t
+        s["properties"]["opened_at"] = None
+        s["properties"]["closed_at"] = now_iso()
+        recalc_segment(s)
+        manifest_put_segment(manifest, file_hash, s)
+        writes[segment_path(file_hash, seg)] = s
+
+    writes[manifest_path(file_hash)] = manifest
+
+    summary = {
+        "id": track_id,
+        "segments": len(parts),
+        "points": sum(len(t) for _, t in parts),
+        "distance_nm": manifest["properties"]["stats"]["distance_total_nm"],
+        "old_distance_nm": (props.get("stats") or {}).get("distance_total_nm"),
+    }
+    if dry_run:
+        summary["dry_run"] = True
+        return summary
+
+    gh_commit_files(
+        DATA_REPO, writes, [legacy_path(file_hash)],
+        f"migrate {file_hash[:8]} v2->v3 ({len(parts)} segments)"
+    )
+    return summary
+
+@app.route("/admin/migrate", methods=["POST"])
+def admin_migrate():
+    """
+    Migriert alle im Admin-Index gelisteten Toerns.
+
+    Body: {"dry_run": true}  -> nichts wird geschrieben, nur gerechnet.
+    Body: {"ids": ["ABC..."]} -> nur diese.
+
+    Vorher pruefen lohnt: `distance_nm` (neu, ohne Pausen-Sonderfall) und
+    `old_distance_nm` (v2, das die Pausen uebersprang) muessen praktisch gleich
+    sein. Weichen sie ab, lag im alten Bestand ein Punkt ueber einer Pause --
+    dann bitte nicht blind schreiben, sondern nachschauen.
+    """
+    if not auth_admin():
+        return jsonify({"error": "unauthorized"}), 401
+    body = request.get_json(force=True, silent=True) or {}
+    dry_run = bool(body.get("dry_run"))
+    only = body.get("ids")
+
+    idx, _ = gh_get_file(ADMIN_REPO, "index.json")
+    tracks = (idx or {}).get("tracks", [])
+    ids = [t["id"] for t in tracks]
+    if only:
+        ids = [i for i in ids if i in only]
+
+    out = []
+    for tid in ids:
+        try:
+            out.append(migrate_one(tid, dry_run=dry_run))
         except Exception as e:
-            import traceback
-            print(f"[refresh-async error] {e}\n{traceback.format_exc()}")
+            out.append({"id": tid, "error": str(e)})
+    return jsonify({"dry_run": dry_run, "count": len(out), "results": out})
 
-    threading.Thread(target=do_refresh, daemon=True).start()
-    return jsonify({"ok": True, "message": "Aktualisierung gestartet"}), 200
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"})
+# ============================================================================
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
