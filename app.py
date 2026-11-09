@@ -80,14 +80,28 @@ def today_iso():
 def gh_headers():
     return {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
 
-def gh_get_file(path):
-    resp = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}",
-                        headers=gh_headers(), timeout=15)
+def gh_url(path):
+    return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+
+def gh_get_sha(path):
+    """Nur die SHA einer Datei (None, wenn sie nicht existiert). Funktioniert auch über 1 MB."""
+    resp = requests.get(gh_url(path), headers=gh_headers(), timeout=30)
     if resp.status_code == 404:
-        return None, None
+        return None
     resp.raise_for_status()
-    data = resp.json()
-    return base64.b64decode(data['content']), data['sha']
+    return resp.json()['sha']
+
+def gh_get_file(path):
+    """Vollständiger Dateiinhalt + SHA, auch über 1 MB (Raw-Download, bis 100 MB).
+    Die normale Contents-API liefert ab 1 MB ein leeres 'content'-Feld – daher der Raw-Header."""
+    sha = gh_get_sha(path)
+    if sha is None:
+        return None, None
+    resp = requests.get(gh_url(path),
+                        headers={**gh_headers(), "Accept": "application/vnd.github.raw+json"},
+                        timeout=60)
+    resp.raise_for_status()
+    return resp.content, sha
 
 def gh_put_file(path, content_bytes, sha, message):
     payload = {"message": message, "content": base64.b64encode(content_bytes).decode()}
@@ -172,31 +186,45 @@ def expand_compact(compact_list):
     return list(hits_by_trip.values())
 
 
-def load_history():
-    content, _ = gh_get_file("history.json")
+# ── Gespeicherter Zustand im Repo ─────────────────────────────────────────────
+HISTORY_FILE   = "history.json"          # daily_hits + currently_sailing
+HISTORY_BACKUP = "history_backup.json"
+PAST_FILE      = "past_trips.json"       # vergangene Törns (wird nie automatisch gekürzt)
+PAST_BACKUP    = "past_trips_backup.json"
+
+def load_json(path, backup_path, default):
+    """Lädt eine JSON-Datei aus dem Repo.
+    Rückgabe: (daten, roh_bytes_wenn_gültig, sha).
+    - Datei fehlt                → Backup, sonst Standardwert
+    - Datei vorhanden, gültig    → Inhalt
+    - Datei vorhanden, unlesbar  → Backup; ist auch das unlesbar: Abbruch.
+      So wird nie mehr ein Standardwert über echte Daten geschrieben."""
+    content, sha = gh_get_file(path)
     if content:
         try:
-            return json.loads(content.decode('utf-8'))
+            return json.loads(content.decode('utf-8')), content, sha
         except Exception:
-            pass
-    # Fallback: Backup laden
-    backup, _ = gh_get_file("history_backup.json")
+            print(f"[load_json] {path} ist unlesbar – versuche {backup_path}")
+    backup, _ = gh_get_file(backup_path)
     if backup:
         try:
-            print("[load_history] history.json leer/kaputt – lade Backup")
-            return json.loads(backup.decode('utf-8'))
+            data = json.loads(backup.decode('utf-8'))
+            print(f"[load_json] {path} aus {backup_path} geladen")
+            return data, None, sha
         except Exception:
             pass
-    return {"daily_hits": [], "currently_sailing": [], "past_trips": []}
+    if content is not None:
+        raise RuntimeError(f"{path} existiert, ist aber nicht lesbar (Backup ebenfalls) – "
+                           f"Lauf abgebrochen, damit keine Daten überschrieben werden.")
+    return default, None, sha
 
-def save_history(history, message="History aktualisiert"):
-    # Erst Backup der aktuellen Version anlegen
-    current, sha_backup = gh_get_file("history_backup.json")
-    if current is not None:
-        gh_put_file("history_backup.json", current, sha_backup, f"Backup: {message}")
-    # Dann neue Version speichern
-    _, sha = gh_get_file("history.json")
-    gh_put_file("history.json", json.dumps(history, ensure_ascii=False).encode('utf-8'), sha, message)
+def save_json(path, backup_path, data, previous_raw, sha, message):
+    """Sichert zuerst die bisherige gültige Version als Backup, dann wird gespeichert.
+    Die SHA stammt vom Laden – hat jemand die Datei zwischenzeitlich geändert,
+    lehnt GitHub das Speichern ab statt sie still zu überschreiben."""
+    if previous_raw:
+        gh_put_file(backup_path, previous_raw, gh_get_sha(backup_path), f"Backup: {message}")
+    gh_put_file(path, json.dumps(data, ensure_ascii=False).encode('utf-8'), sha, message)
 
 # ── Daten laden ───────────────────────────────────────────────────────────────
 def login():
@@ -395,22 +423,12 @@ def detect_changes(new_hits, prev_compact, today):
     return sorted(other_changes, key=lambda x: x.get('start_iso', ''))
 
 # ── Fahrstatus ────────────────────────────────────────────────────────────────
-def update_sailing_status(history, new_hits, prev_compact, today):
-    new_idx = {f"{h.get('trip_date_id')}_{y.get('id')}": True
-               for h in new_hits for y in h.get('yachts', [])}
-    existing_keys = {r['_yacht_key'] for r in history.get('currently_sailing', [])}
-
-    # Kompakte Einträge auf fahrende Boote prüfen
-    for c in prev_compact:
-        key = c['k']
-        if key not in new_idx and key not in existing_keys:
-            start_iso = c.get('si', '')
-            end_iso   = c.get('ei', '')
-            if start_iso and start_iso <= today and end_iso >= today:
-                history['currently_sailing'].append({
-                    '_yacht_key':    key,
-                    '_start_iso':    start_iso,
-                    '_end_iso':      end_iso,
+def compact_to_row(c):
+    """Kompakten daily_hits-Eintrag in eine vollständige Tabellenzeile umwandeln."""
+    return {
+                    '_yacht_key':    c['k'],
+                    '_start_iso':    c.get('si', ''),
+                    '_end_iso':      c.get('ei', ''),
                     'Startdatum':    c.get('sd', ''),
                     'Enddatum':      c.get('ed', ''),
                     'Reisename':     c.get('rn', ''),
@@ -437,20 +455,45 @@ def update_sailing_status(history, new_hits, prev_compact, today):
                     'Skipper Status': SKIPPER_STATUS_LABELS.get(c.get('sst',''), c.get('sst','') or '—'),
                     'Flotillenführer': 'Ja' if c.get('sfl') else 'Nein',
                     'Bewerbungen':   ', '.join(c.get('pr', [])),
-                })
+    }
 
-    cutoff = (datetime.datetime.now(datetime.UTC) - datetime.timedelta(weeks=4)).strftime('%Y-%m-%d')
-    still, ended = [], []
-    for row in history.get('currently_sailing', []):
-        (ended if row.get('_end_iso','') < today else still).append(row)
+def update_sailing_status(history, past_trips, new_hits, prev_compact, today):
+    """Boote, die seit dem letzten Tageslauf aus dem Skipperplan verschwunden sind:
+    - Start in der Zukunft          → Storno (nur Changelog, hier ignoriert)
+    - gestartet, Ende noch offen    → currently_sailing
+    - gestartet UND schon beendet   → direkt past_trips (z.B. nach einem Ausfall)
+    Danach wandern beendete Törns aus currently_sailing nach past_trips."""
+    new_idx = {f"{h.get('trip_date_id')}_{y.get('id')}"
+               for h in new_hits for y in h.get('yachts', [])}
+    sailing   = history.setdefault('currently_sailing', [])
+    past_keys = {r['_yacht_key'] for r in past_trips}
+    known     = {r['_yacht_key'] for r in sailing} | past_keys
+
+    for c in prev_compact:
+        key = c['k']
+        if key in new_idx or key in known:
+            continue
+        start_iso, end_iso = c.get('si', ''), c.get('ei', '')
+        if not start_iso or start_iso > today:
+            continue
+        row = compact_to_row(c)
+        if end_iso and end_iso < today:
+            past_trips.append(row)
+            past_keys.add(key)
+        else:
+            sailing.append(row)
+        known.add(key)
+
+    still = []
+    for row in sailing:
+        if row.get('_end_iso', '') < today:
+            if row['_yacht_key'] not in past_keys:
+                past_trips.append(row)
+                past_keys.add(row['_yacht_key'])
+        else:
+            still.append(row)
     history['currently_sailing'] = still
-
-    past_keys = {r['_yacht_key'] for r in history.get('past_trips', [])}
-    for row in ended:
-        if row['_yacht_key'] not in past_keys:
-            history['past_trips'].append(row)
-    history['past_trips'] = history.get('past_trips', [])
-    return history
+    return history, past_trips
 
 # ── Excel bauen (xlsxwriter) ──────────────────────────────────────────────────
 def build_excel(rows, skipper_data, changelog=None, currently_sailing=None, past_trips=None):
@@ -599,7 +642,7 @@ def send_notification(now_str, termine, yachten, changelog, sailing):
         <table style="border-collapse:collapse;width:100%;min-width:480px;font-family:Arial">
           <tr style="background:#1F4E79;color:#fff">
             <th style="{th}">Typ</th><th style="{th}">Reise</th><th style="{th}">Start</th>
-            <th style="{th}">Yacht</th><th style="{th}">Skipper</th>
+            <th style="{th}">Yacht</th><th style="{th}">Skipper neu</th>
             <th style="{th}">Skipper alt</th><th style="{th}">Neue Bewerbungen</th>
           </tr>{cl_rows}
         </table></div>"""
@@ -652,70 +695,75 @@ def check_password():
 def check():
     return (jsonify({"ok": True}) if check_password() else (jsonify({"ok": False}), 401))
 
+def run_refresh(source):
+    """Kompletter Ablauf, gemeinsam für /refresh und /refresh-async.
+    source='daily': aktualisiert die Vergleichsbasis, skipperplan_daily.xlsx und schickt die Mail."""
+    now_str  = datetime.datetime.now(datetime.UTC).strftime('%d.%m.%Y %H:%M UTC')
+    today    = today_iso()
+    api_key  = login()
+    new_hits = fetch_algolia(api_key)
+
+    # Laden – bricht ab, falls eine vorhandene Datei unlesbar ist
+    history, hist_raw, hist_sha = load_json(HISTORY_FILE, HISTORY_BACKUP,
+                                            {"daily_hits": [], "currently_sailing": []})
+    past_trips, past_raw, past_sha = load_json(PAST_FILE, PAST_BACKUP, [])
+
+    # Einmalige Migration: past_trips aus history.json nach past_trips.json
+    old_past = history.pop('past_trips', None) or []
+    if old_past:
+        keys = {r['_yacht_key'] for r in past_trips}
+        past_trips.extend(r for r in old_past if r['_yacht_key'] not in keys)
+
+    prev_compact = history.get("daily_hits", [])
+    changelog    = detect_changes(new_hits, prev_compact, today) if prev_compact else []
+    history, past_trips = update_sailing_status(history, past_trips, new_hits, prev_compact, today)
+    if source == "daily" or not prev_compact:
+        history["daily_hits"] = compact_hits(new_hits)
+
+    rows         = extract_rows(new_hits)
+    skipper_data = build_skipper_data(new_hits)
+    excel_bytes  = build_excel(rows, skipper_data, changelog,
+                               history['currently_sailing'], past_trips).read()
+
+    # Speichern: erst vergangene Törns, dann History. Fällt der zweite Schritt aus,
+    # werden beim nächsten Lauf keine Törns doppelt angelegt (Abgleich über _yacht_key).
+    save_json(PAST_FILE, PAST_BACKUP, past_trips, past_raw, past_sha,
+              f"Vergangene Törns: {now_str}")
+    save_json(HISTORY_FILE, HISTORY_BACKUP, history, hist_raw, hist_sha, f"History: {now_str}")
+    gh_put_file("skipperplan.xlsx", excel_bytes, gh_get_sha("skipperplan.xlsx"),
+                f"Skipperplan: {now_str}")
+    if source == "daily":
+        gh_put_file("skipperplan_daily.xlsx", excel_bytes, gh_get_sha("skipperplan_daily.xlsx"),
+                    f"Täglich: {now_str}")
+        send_notification(now_str, len(new_hits), len(rows), changelog,
+                          len(history['currently_sailing']))
+
+    return {"ok": True, "updated": now_str,
+            "termine": len(new_hits), "yachten": len(rows),
+            "changes": len(changelog), "sailing": len(history['currently_sailing']),
+            "past": len(past_trips)}
+
+
 @app.route("/refresh", methods=["GET"])
 def refresh():
-    """Synchroner Endpunkt – für manuelle Aktualisierung über die Webseite."""
-    source  = request.args.get("source", "manual")
+    """Synchroner Endpunkt – Webseite (manual) und GitHub-Workflow (source=daily)."""
     try:
-        now_str  = datetime.datetime.now(datetime.UTC).strftime('%d.%m.%Y %H:%M UTC')
-        today    = today_iso()
-        api_key  = login()
-        new_hits = fetch_algolia(api_key)
-        history  = load_history()
-        prev_compact = history.get("daily_hits", [])
-        changelog = detect_changes(new_hits, prev_compact, today) if prev_compact else []
-        history   = update_sailing_status(history, new_hits, prev_compact, today)
-        if source == "daily" or not prev_compact:
-            history["daily_hits"] = compact_hits(new_hits)
-        rows         = extract_rows(new_hits)
-        skipper_data = build_skipper_data(new_hits)
-        buf          = build_excel(rows, skipper_data, changelog,
-                                   history['currently_sailing'], history['past_trips'])
-        excel_bytes  = buf.read()
-        save_history(history, f"History: {now_str}")
-        _, sha_main = gh_get_file("skipperplan.xlsx")
-        gh_put_file("skipperplan.xlsx", excel_bytes, sha_main, f"Skipperplan: {now_str}")
-        if source == "daily":
-            _, sha_daily = gh_get_file("skipperplan_daily.xlsx")
-            gh_put_file("skipperplan_daily.xlsx", excel_bytes, sha_daily, f"Täglich: {now_str}")
-            send_notification(now_str, len(new_hits), len(rows), changelog,
-                              len(history['currently_sailing']))
-        return jsonify({"ok": True, "updated": now_str,
-                        "termine": len(new_hits), "yachten": len(rows),
-                        "changes": len(changelog), "sailing": len(history['currently_sailing'])})
+        return jsonify(run_refresh(request.args.get("source", "manual")))
     except Exception as e:
         import traceback
+        print(f"[refresh error] {e}\n{traceback.format_exc()}")
         return jsonify({"error": str(e), "trace": traceback.format_exc()[-800:]}), 500
 
 
 @app.route("/refresh-async", methods=["GET"])
 def refresh_async():
-    """Asynchroner Endpunkt – für cron-job.org (antwortet sofort, arbeitet im Hintergrund)."""
+    """Asynchroner Endpunkt – antwortet sofort, arbeitet im Hintergrund (Standard: daily)."""
     import threading
+    source = request.args.get("source", "daily")
 
     def do_refresh():
         try:
-            now_str  = datetime.datetime.now(datetime.UTC).strftime('%d.%m.%Y %H:%M UTC')
-            today    = today_iso()
-            api_key  = login()
-            new_hits = fetch_algolia(api_key)
-            history  = load_history()
-            prev_compact = history.get("daily_hits", [])
-            changelog = detect_changes(new_hits, prev_compact, today) if prev_compact else []
-            history   = update_sailing_status(history, new_hits, prev_compact, today)
-            history["daily_hits"] = compact_hits(new_hits)
-            rows         = extract_rows(new_hits)
-            skipper_data = build_skipper_data(new_hits)
-            buf          = build_excel(rows, skipper_data, changelog,
-                                       history['currently_sailing'], history['past_trips'])
-            excel_bytes  = buf.read()
-            save_history(history, f"History: {now_str}")
-            _, sha_main = gh_get_file("skipperplan.xlsx")
-            gh_put_file("skipperplan.xlsx", excel_bytes, sha_main, f"Skipperplan: {now_str}")
-            _, sha_daily = gh_get_file("skipperplan_daily.xlsx")
-            gh_put_file("skipperplan_daily.xlsx", excel_bytes, sha_daily, f"Täglich: {now_str}")
-            send_notification(now_str, len(new_hits), len(rows), changelog,
-                              len(history['currently_sailing']))
+            run_refresh(source)
         except Exception as e:
             import traceback
             print(f"[refresh-async error] {e}\n{traceback.format_exc()}")
