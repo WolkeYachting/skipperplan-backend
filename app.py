@@ -24,13 +24,6 @@ GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN",  "")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 NOTIFY_EMAILS  = os.environ.get("NOTIFY_EMAILS",  "")
 
-STAMMSKIPPER = {
-    6429:'Julian S', 13707:'Miriam M', 2430:'Gregor K', 13035:'Nicole M',
-    951:'Martin S',  14111:'Leon H',   17277:'David H',  28325:'Adam B',
-    7022:'Mareike W',20147:'Yanik K',  6896:'Malte W',   9724:'Luke W',
-    6758:'Marc L',   347:'Mario L',    9375:'Clemens P',
-}
-
 COLUMN_ORDER = [
     'Startdatum','Enddatum','Reisename','Typ','Tage','Altersgruppe',
     'Skipper','ID Skipper','Plätze gesamt','Plätze belegt',
@@ -310,21 +303,94 @@ def extract_rows(hits):
             rows.append(make_trip_row(h, y, i, proposals))
     return rows
 
-def build_skipper_data(hits):
+# ── Saisons ───────────────────────────────────────────────────────────────────
+# saisons.json im Repo ordnet jede Reise (Trip ID) dem Sommer oder Winter zu:
+#   { "40": {"name": "Polynesien", "saison": "Winter"}, ... }
+# Das Saisonjahr ergibt sich aus dem Startdatum:
+#   Sommer         → "SS 26"
+#   Winter ab Juli → "WS 26-27", Winter Jan–Juni → "WS 25-26"
+# ("/" ist in Excel-Blattnamen nicht erlaubt, daher "-")
+SEASON_FILE = "saisons.json"
+
+def load_season_map():
+    """Liefert (zuordnung, fehlermeldung). Eine fehlerhafte Datei bricht den Lauf nicht ab,
+    sondern erscheint in der Mail unter 'Aktion erforderlich'."""
+    content, _ = gh_get_file(SEASON_FILE)
+    if content is None:
+        return {}, f"{SEASON_FILE} fehlt im Repo – keine Reise ist einer Saison zugeordnet."
+    try:
+        data = json.loads(content.decode('utf-8'))
+        return {str(k): v for k, v in data.items()}, None
+    except Exception as e:
+        return {}, f"{SEASON_FILE} ist fehlerhaft und wurde ignoriert ({e})."
+
+def season_of(row, season_map):
+    """(Blattname-Kürzel, Sortierschlüssel) oder None, wenn die Reise nicht zugeordnet ist."""
+    entry = season_map.get(str(row.get('Trip ID', '')))
+    kind  = (entry or {}).get('saison') if isinstance(entry, dict) else None
+    start = row.get('_start_iso', '')
+    if kind not in ('Sommer', 'Winter') or len(start) < 7:
+        return None
+    y, m = int(start[:4]), int(start[5:7])
+    if kind == 'Sommer':
+        return f"SS {y % 100:02d}", y * 2
+    a = y if m >= 7 else y - 1
+    return f"WS {a % 100:02d}-{(a + 1) % 100:02d}", a * 2 + 1
+
+def has_skipper(row):
+    sid = str(row.get('ID Skipper', '') or '').strip()
+    return bool(sid) and sid != 'None'
+
+def build_season_data(rows, currently_sailing, past_trips, season_map):
+    """Teilt alle Törns auf Saisons auf.
+    Rückgabe:
+      seasons       {kürzel: {'key', 'past': [...], 'skipper': [(name, id, törns, wochen), ...]}}
+      past_unassigned  vergangene Törns ohne Zuordnung (Reiter 'Ohne Saison')
+      unassigned_trips Reisen ohne Zuordnung für die Mail (alle Zeiträume)"""
     from collections import defaultdict
-    data = defaultdict(lambda: {'name':'','törns':0,'total_weeks':0,'summer_weeks':0})
-    for h in hits:
-        weeks  = days_to_weeks(parse_days(first(h.get('trip_days', []))))
-        season = (first(h.get('season', '')) or '').lower()
-        for y in h.get('yachts', []):
-            sk = y.get('skipper') or {}
-            if not sk.get('id') or not sk.get('name'): continue
-            d = data[sk['id']]
-            d['name'] = sk['name']
-            d['törns'] += 1
-            d['total_weeks'] += weeks
-            if season == 'summer': d['summer_weeks'] += weeks
-    return sorted(data.items(), key=lambda x: -x[1]['törns'])
+    seasons = {}
+    sk_count = defaultdict(lambda: defaultdict(lambda: {'name': '', 'törns': 0, 'wochen': 0}))
+    past_unassigned = []
+    unassigned = {}
+
+    def handle(row, is_past):
+        s = season_of(row, season_map)
+        if s is None:
+            tid = str(row.get('Trip ID', '') or '?')
+            u = unassigned.setdefault(tid, {'trip_id': tid, 'namen': set(), 'von': '9999', 'bis': '0000', 'termine': set()})
+            u['namen'].add(row.get('Reisename', ''))
+            u['von'] = min(u['von'], row.get('_start_iso', '') or '9999')
+            u['bis'] = max(u['bis'], row.get('_end_iso', '') or '0000')
+            u['termine'].add(row.get('Trip Date ID', ''))
+            if is_past:
+                past_unassigned.append(row)
+            return
+        label, key = s
+        season = seasons.setdefault(label, {'key': key, 'past': [], 'skipper': []})
+        if is_past:
+            season['past'].append(row)
+        if has_skipper(row):
+            d = sk_count[label][str(row['ID Skipper'])]
+            d['name']    = row.get('Skipper', '')
+            d['törns']  += 1
+            d['wochen'] += days_to_weeks(parse_days(row.get('Tage', '')))
+
+    for r in past_trips:        handle(r, True)
+    for r in currently_sailing: handle(r, False)
+    for r in rows:              handle(r, False)
+
+    for label, skippers in sk_count.items():
+        seasons[label]['skipper'] = sorted(
+            ((d['name'], int(sid) if sid.isdigit() else sid, d['törns'], d['wochen'])
+             for sid, d in skippers.items()),
+            key=lambda x: (-x[2], x[0]))
+
+    unassigned_trips = sorted(
+        ({'trip_id': u['trip_id'], 'name': ', '.join(sorted(n for n in u['namen'] if n)),
+          'von': u['von'], 'bis': u['bis'], 'termine': len(u['termine'])}
+         for u in unassigned.values()),
+        key=lambda x: x['von'])
+    return seasons, past_unassigned, unassigned_trips
 
 # ── Changelog ────────────────────────────────────────────────────────────────
 def detect_changes(new_hits, prev_compact, today):
@@ -496,7 +562,7 @@ def update_sailing_status(history, past_trips, new_hits, prev_compact, today):
     return history, past_trips
 
 # ── Excel bauen (xlsxwriter) ──────────────────────────────────────────────────
-def build_excel(rows, skipper_data, changelog=None, currently_sailing=None, past_trips=None):
+def build_excel(rows, changelog, currently_sailing, seasons, past_unassigned):
     buf = io.BytesIO()
     wb  = xlsxwriter.Workbook(buf, {'in_memory': True})
 
@@ -521,9 +587,6 @@ def build_excel(rows, skipper_data, changelog=None, currently_sailing=None, past
     no_skip  = fmt('B4F7B4')
     cancel   = fmt('FFCCCC')
     unconf   = fmt('FCE4D6')
-    stamm_f  = fmt('C6EFCE')
-    adv_f    = fmt('FFEB9C')
-    hobby_f  = fmt('FFFFFF')
     cl_chg   = fmt('FFF2CC')
     cl_new   = fmt('E2EFDA')
     cl_can   = fmt('FCE4D6')
@@ -560,9 +623,6 @@ def build_excel(rows, skipper_data, changelog=None, currently_sailing=None, past
     # Aktuell fahrend
     write_trip_sheet('Aktuell fahrend', currently_sailing or [], sort_key='_start_iso')
 
-    # Vergangene Törns
-    write_trip_sheet('Vergangene Törns', past_trips or [], sort_key='_end_iso', reverse=True)
-
     # Changelog
     if changelog is not None:
         ws_cl = wb.add_worksheet('Changelog')
@@ -585,34 +645,74 @@ def build_excel(rows, skipper_data, changelog=None, currently_sailing=None, past
             for c, val in enumerate(vals):
                 ws_cl.write(r, c, val, cf)
 
-    # Skipper
-    ws_sk = wb.add_worksheet('Skipper')
-    sk_cols   = ['Skipper','ID','Törns','Wochen','Status']
-    sk_widths = [24,10,8,9,16]
-    ws_sk.freeze_panes(1, 0)
-    ws_sk.autofilter(0, 0, 0, 4)
-    for c, (col, w) in enumerate(zip(sk_cols, sk_widths)):
-        ws_sk.set_column(c, c, w)
-        ws_sk.write(0, c, col, hdr)
-    ws_sk.set_row(0, 32)
-    status_fmt = {'Stammskipper': stamm_f, 'Advanced': adv_f, 'Hobby': hobby_f}
-    for r, (sid, d) in enumerate(skipper_data, 1):
-        status  = 'Stammskipper' if sid in STAMMSKIPPER else ('Advanced' if d['summer_weeks'] > 5 else 'Hobby')
-        def_fmt = row_a if r%2==1 else row_b
-        def_ctr = center_a if r%2==1 else center_b
-        sf      = status_fmt[status]
-        ws_sk.write(r, 0, d['name'],        def_fmt)
-        ws_sk.write(r, 1, sid,              def_ctr)
-        ws_sk.write(r, 2, d['törns'],       def_ctr)
-        ws_sk.write(r, 3, d['total_weeks'], def_ctr)
-        ws_sk.write(r, 4, status,           sf)
+    # Vergangene Törns ohne Saison-Zuordnung (nur wenn vorhanden)
+    if past_unassigned:
+        write_trip_sheet('Ohne Saison', past_unassigned, sort_key='_end_iso', reverse=True)
+
+    # Pro Saison (neueste zuerst): Skipper, dann vergangene Törns
+    sk_cols   = ['Skipper', 'ID', 'Törns', 'Wochen']
+    sk_widths = [24, 10, 8, 9]
+    for label, season in sorted(seasons.items(), key=lambda kv: -kv[1]['key']):
+        ws_sk = wb.add_worksheet(f'Skipper {label}')
+        ws_sk.freeze_panes(1, 0)
+        ws_sk.autofilter(0, 0, 0, len(sk_cols) - 1)
+        for c, (col, w) in enumerate(zip(sk_cols, sk_widths)):
+            ws_sk.set_column(c, c, w)
+            ws_sk.write(0, c, col, hdr)
+        ws_sk.set_row(0, 32)
+        for r, (name, sid, toerns, wochen) in enumerate(season['skipper'], 1):
+            def_fmt = row_a if r % 2 == 1 else row_b
+            def_ctr = center_a if r % 2 == 1 else center_b
+            ws_sk.write(r, 0, name,   def_fmt)
+            ws_sk.write(r, 1, sid,    def_ctr)
+            ws_sk.write(r, 2, toerns, def_ctr)
+            ws_sk.write(r, 3, wochen, def_ctr)
+
+        if season['past']:
+            write_trip_sheet(f'Vergangen {label}', season['past'], sort_key='_end_iso', reverse=True)
 
     wb.close()
     buf.seek(0)
     return buf
 
 # ── E-Mail Benachrichtigung ───────────────────────────────────────────────────
-def send_notification(now_str, termine, yachten, changelog, sailing):
+def iso_to_de(iso):
+    return f"{iso[8:10]}.{iso[5:7]}.{iso[:4]}" if len(iso) == 10 else iso
+
+def build_action_html(unassigned_trips, season_error):
+    """Block 'Aktion erforderlich' – leer, wenn nichts zu tun ist."""
+    if not unassigned_trips and not season_error:
+        return ''
+    td = "padding:6px 8px;border:1px solid #f0c9a8;font-family:Arial;font-size:12px"
+    parts = []
+    if season_error:
+        parts.append(f'<p style="font-family:Arial;font-size:12px;margin:0 0 8px">{season_error}</p>')
+    if unassigned_trips:
+        rows = "".join(
+            f"""<tr><td style="{td}">{t['trip_id']}</td><td style="{td}">{t['name']}</td>
+                <td style="{td};white-space:nowrap">{iso_to_de(t['von'])} – {iso_to_de(t['bis'])}</td>
+                <td style="{td};text-align:center">{t['termine']}</td></tr>"""
+            for t in unassigned_trips)
+        parts.append(f"""
+          <p style="font-family:Arial;font-size:12px;margin:0 0 8px">
+            {len(unassigned_trips)} Reise(n) ohne Saison-Zuordnung. Bitte in <b>{SEASON_FILE}</b> eintragen,
+            z.B. <code>"{unassigned_trips[0]['trip_id']}": {{"name": "…", "saison": "Sommer"}}</code>
+            (oder <code>"Winter"</code>).</p>
+          <div style="overflow-x:auto">
+          <table style="border-collapse:collapse;width:100%;font-family:Arial">
+            <tr style="background:#f6dcc6">
+              <th style="{td};text-align:left">Trip ID</th><th style="{td};text-align:left">Reise</th>
+              <th style="{td};text-align:left">Zeitraum</th><th style="{td}">Termine</th>
+            </tr>{rows}
+          </table></div>""")
+    return f"""
+      <div style="background:#fff4ea;border:1px solid #f0a868;border-radius:8px;padding:12px;margin-bottom:16px">
+        <div style="font-family:Arial;font-size:14px;font-weight:bold;color:#b45309;margin-bottom:8px">
+          ⚠ Aktion erforderlich</div>
+        {''.join(parts)}
+      </div>"""
+
+def send_notification(now_str, termine, yachten, changelog, sailing, action_html=''):
     if not RESEND_API_KEY:
         return
 
@@ -667,6 +767,7 @@ def send_notification(now_str, termine, yachten, changelog, sailing):
       <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
         {stat(termine,'Termine')}{stat(yachten,'Yachten')}{stat(sailing,'Fahrend')}{stat(len(changelog),'Änderungen')}
       </div>
+      {action_html}
       {changelog_html}
       <p style="font-size:11px;color:#aaa;margin-top:16px">Skipperplan · Flotilla Management</p>
     </div></body></html>"""
@@ -720,10 +821,12 @@ def run_refresh(source):
     if source == "daily" or not prev_compact:
         history["daily_hits"] = compact_hits(new_hits)
 
-    rows         = extract_rows(new_hits)
-    skipper_data = build_skipper_data(new_hits)
-    excel_bytes  = build_excel(rows, skipper_data, changelog,
-                               history['currently_sailing'], past_trips).read()
+    rows = extract_rows(new_hits)
+    season_map, season_error = load_season_map()
+    seasons, past_unassigned, unassigned_trips = build_season_data(
+        rows, history['currently_sailing'], past_trips, season_map)
+    excel_bytes = build_excel(rows, changelog, history['currently_sailing'],
+                              seasons, past_unassigned).read()
 
     # Speichern: erst vergangene Törns, dann History. Fällt der zweite Schritt aus,
     # werden beim nächsten Lauf keine Törns doppelt angelegt (Abgleich über _yacht_key).
@@ -736,12 +839,16 @@ def run_refresh(source):
         gh_put_file("skipperplan_daily.xlsx", excel_bytes, gh_get_sha("skipperplan_daily.xlsx"),
                     f"Täglich: {now_str}")
         send_notification(now_str, len(new_hits), len(rows), changelog,
-                          len(history['currently_sailing']))
+                          len(history['currently_sailing']),
+                          build_action_html(unassigned_trips, season_error))
 
     return {"ok": True, "updated": now_str,
             "termine": len(new_hits), "yachten": len(rows),
             "changes": len(changelog), "sailing": len(history['currently_sailing']),
-            "past": len(past_trips)}
+            "past": len(past_trips),
+            "saisons": sorted(seasons, key=lambda s: -seasons[s]['key']),
+            "ohne_saison": [t['trip_id'] for t in unassigned_trips],
+            "saison_fehler": season_error}
 
 
 @app.route("/refresh", methods=["GET"])
