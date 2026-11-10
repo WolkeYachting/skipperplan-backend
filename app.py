@@ -310,7 +310,28 @@ def extract_rows(hits):
 #   Sommer         → "SS 26"
 #   Winter ab Juli → "WS 26-27", Winter Jan–Juni → "WS 25-26"
 # ("/" ist in Excel-Blattnamen nicht erlaubt, daher "-")
-SEASON_FILE = "saisons.json"
+SEASON_FILE  = "saisons.json"
+ACTIONS_FILE = "aktionen.json"   # offene Zuordnungen für die Webseite
+PAGE_URL     = "https://wolkeyachting.github.io/skipperplan-web/"
+
+def load_actions():
+    """(aktionen, sha). Fehlt die Datei oder ist sie unlesbar: leere Liste."""
+    content, sha = gh_get_file(ACTIONS_FILE)
+    if content:
+        try:
+            data = json.loads(content.decode('utf-8'))
+            return {"reisen": data.get("reisen", []), "fehler": data.get("fehler")}, sha
+        except Exception:
+            pass
+    return {"reisen": [], "fehler": None}, sha
+
+def save_actions(unassigned_trips, season_error):
+    """Schreibt aktionen.json nur, wenn sich der Inhalt geändert hat (vermeidet leere Commits)."""
+    new = json.dumps({"reisen": unassigned_trips, "fehler": season_error},
+                     ensure_ascii=False, indent=2).encode('utf-8')
+    old, sha = gh_get_file(ACTIONS_FILE)
+    if old != new:
+        gh_put_file(ACTIONS_FILE, new, sha, f"Aktionen: {len(unassigned_trips)} offen")
 
 def load_season_map():
     """Liefert (zuordnung, fehlermeldung). Eine fehlerhafte Datei bricht den Lauf nicht ab,
@@ -347,7 +368,7 @@ def build_season_data(rows, currently_sailing, past_trips, season_map):
       seasons       {kürzel: {'key', 'past': [...], 'skipper': [(name, id, törns, wochen), ...]}}
       past_unassigned  vergangene Törns ohne Zuordnung (Reiter 'Ohne Saison')
       unassigned_trips Reisen ohne Zuordnung für die Mail (alle Zeiträume)"""
-    from collections import defaultdict
+    from collections import defaultdict, Counter
     seasons = {}
     sk_count = defaultdict(lambda: defaultdict(lambda: {'name': '', 'törns': 0, 'wochen': 0}))
     past_unassigned = []
@@ -357,7 +378,10 @@ def build_season_data(rows, currently_sailing, past_trips, season_map):
         s = season_of(row, season_map)
         if s is None:
             tid = str(row.get('Trip ID', '') or '?')
-            u = unassigned.setdefault(tid, {'trip_id': tid, 'namen': set(), 'von': '9999', 'bis': '0000', 'termine': set()})
+            u = unassigned.setdefault(tid, {'trip_id': tid, 'namen': set(), 'von': '9999', 'bis': '0000',
+                                            'termine': set(), 'plattform': Counter()})
+            if row.get('Saison'):
+                u['plattform'][row['Saison']] += 1
             u['namen'].add(row.get('Reisename', ''))
             u['von'] = min(u['von'], row.get('_start_iso', '') or '9999')
             u['bis'] = max(u['bis'], row.get('_end_iso', '') or '0000')
@@ -387,7 +411,10 @@ def build_season_data(rows, currently_sailing, past_trips, season_map):
 
     unassigned_trips = sorted(
         ({'trip_id': u['trip_id'], 'name': ', '.join(sorted(n for n in u['namen'] if n)),
-          'von': u['von'], 'bis': u['bis'], 'termine': len(u['termine'])}
+          'von': u['von'], 'bis': u['bis'], 'termine': len(u['termine']),
+          'plattform': {'Summer': 'Sommer', 'Winter': 'Winter'}.get(
+              u['plattform'].most_common(1)[0][0], u['plattform'].most_common(1)[0][0])
+              if u['plattform'] else ''}
          for u in unassigned.values()),
         key=lambda x: x['von'])
     return seasons, past_unassigned, unassigned_trips
@@ -695,9 +722,9 @@ def build_action_html(unassigned_trips, season_error):
             for t in unassigned_trips)
         parts.append(f"""
           <p style="font-family:Arial;font-size:12px;margin:0 0 8px">
-            {len(unassigned_trips)} Reise(n) ohne Saison-Zuordnung. Bitte in <b>{SEASON_FILE}</b> eintragen,
-            z.B. <code>"{unassigned_trips[0]['trip_id']}": {{"name": "…", "saison": "Sommer"}}</code>
-            (oder <code>"Winter"</code>).</p>
+            {len(unassigned_trips)} Reise(n) ohne Saison-Zuordnung.
+            <a href="{PAGE_URL}" style="color:#b45309;font-weight:bold">Auf der Skipperplan-Seite zuordnen</a>
+            (oder direkt in <b>{SEASON_FILE}</b> im Repo).</p>
           <div style="overflow-x:auto">
           <table style="border-collapse:collapse;width:100%;font-family:Arial">
             <tr style="background:#f6dcc6">
@@ -819,7 +846,50 @@ def check():
         updated = last_update_iso()
     except Exception:
         updated = None
-    return jsonify({"ok": True, "updated": updated})
+    try:
+        actions, _ = load_actions()
+    except Exception:
+        actions = {"reisen": [], "fehler": None}
+    return jsonify({"ok": True, "updated": updated, "aktionen": actions})
+
+@app.route("/saison", methods=["POST"])
+def assign_season():
+    """Ordnet eine offene Reise einer Saison zu.
+    Body: {"trip_id": "202", "saison": "Sommer" | "Winter"}
+    Wirkt ab der nächsten Aktualisierung."""
+    if not password_ok():
+        return denied()
+    body    = request.get_json(silent=True) or {}
+    trip_id = str(body.get("trip_id", "")).strip()
+    saison  = body.get("saison")
+    if saison not in ("Sommer", "Winter") or not trip_id:
+        return jsonify({"ok": False, "error": "Ungültige Angaben"}), 400
+
+    actions, actions_sha = load_actions()
+    trip = next((t for t in actions["reisen"] if str(t.get("trip_id")) == trip_id), None)
+    if trip is None:
+        return jsonify({"ok": False, "error": f"Reise {trip_id} ist nicht offen"}), 409
+
+    content, sha = gh_get_file(SEASON_FILE)
+    if content is None:
+        season_map = {}
+    else:
+        try:
+            season_map = json.loads(content.decode('utf-8'))
+        except Exception:
+            return jsonify({"ok": False, "error": f"{SEASON_FILE} ist fehlerhaft – bitte im Repo "
+                                                  f"korrigieren, erst danach ist eine Zuordnung möglich."}), 409
+
+    name = trip.get("name", "")
+    season_map[trip_id] = {"name": name, "saison": saison}
+    gh_put_file(SEASON_FILE, json.dumps(season_map, ensure_ascii=False, indent=2).encode('utf-8'),
+                sha, f"Saison zugeordnet: {name} ({trip_id}) → {saison}")
+
+    rest = [t for t in actions["reisen"] if str(t.get("trip_id")) != trip_id]
+    gh_put_file(ACTIONS_FILE,
+                json.dumps({"reisen": rest, "fehler": actions["fehler"]}, ensure_ascii=False, indent=2).encode('utf-8'),
+                actions_sha, f"Aktionen: {len(rest)} offen")
+    return jsonify({"ok": True, "trip_id": trip_id, "saison": saison, "offen": len(rest)})
 
 @app.route("/download", methods=["GET"])
 def download():
@@ -873,6 +943,7 @@ def run_refresh(source):
     save_json(HISTORY_FILE, HISTORY_BACKUP, history, hist_raw, hist_sha, f"History: {now_str}")
     gh_put_file("skipperplan.xlsx", excel_bytes, gh_get_sha("skipperplan.xlsx"),
                 f"Skipperplan: {now_str}")
+    save_actions(unassigned_trips, season_error)
     if source == "daily":
         gh_put_file("skipperplan_daily.xlsx", excel_bytes, gh_get_sha("skipperplan_daily.xlsx"),
                     f"Täglich: {now_str}")
