@@ -1,9 +1,9 @@
 """
 app.py  –  Skipperplan Backend (xlsxwriter)
 """
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
-import requests, os, io, re, datetime, json, base64
+import requests, os, io, re, datetime, json, base64, hmac, time
 import xlsxwriter
 
 app = Flask(__name__)
@@ -789,12 +789,50 @@ def send_notification(now_str, termine, yachten, changelog, sailing, action_html
 
 
 # ── Endpunkte ─────────────────────────────────────────────────────────────────
-def check_password():
-    return not APP_PASSWORD or request.args.get("password","") == APP_PASSWORD
+def password_ok():
+    """Passwort kommt im Header 'X-App-Password' (nicht in der URL – die landet in den Logs).
+    Ohne gesetztes APP_PASSWORD wird alles abgelehnt. Falsche Versuche werden 1 s verzögert."""
+    given = request.headers.get("X-App-Password", "")
+    if APP_PASSWORD and hmac.compare_digest(given.encode(), APP_PASSWORD.encode()):
+        return True
+    time.sleep(1)
+    return False
 
-@app.route("/check", methods=["GET"])
+def denied():
+    return jsonify({"ok": False, "error": "Falsches Passwort"}), 401
+
+def last_update_iso():
+    """Zeitpunkt des letzten Commits von skipperplan.xlsx (UTC, ISO) oder None."""
+    resp = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/commits",
+                        params={"path": "skipperplan.xlsx", "per_page": 1},
+                        headers=gh_headers(), timeout=15)
+    if resp.ok and resp.json():
+        return resp.json()[0]["commit"]["committer"]["date"]
+    return None
+
+@app.route("/check", methods=["POST"])
 def check():
-    return (jsonify({"ok": True}) if check_password() else (jsonify({"ok": False}), 401))
+    """Login: prüft das Passwort und liefert den Stand der Excel."""
+    if not password_ok():
+        return denied()
+    try:
+        updated = last_update_iso()
+    except Exception:
+        updated = None
+    return jsonify({"ok": True, "updated": updated})
+
+@app.route("/download", methods=["GET"])
+def download():
+    """Liefert die aktuelle Excel aus dem privaten Repo."""
+    if not password_ok():
+        return denied()
+    content, _ = gh_get_file("skipperplan.xlsx")
+    if content is None:
+        return jsonify({"ok": False, "error": "skipperplan.xlsx nicht gefunden"}), 404
+    return Response(content,
+                    mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": "attachment; filename=skipperplan.xlsx",
+                             "Cache-Control": "no-store"})
 
 def run_refresh(source):
     """Kompletter Ablauf, gemeinsam für /refresh und /refresh-async.
@@ -854,6 +892,8 @@ def run_refresh(source):
 @app.route("/refresh", methods=["GET"])
 def refresh():
     """Synchroner Endpunkt – Webseite (manual) und GitHub-Workflow (source=daily)."""
+    if not password_ok():
+        return denied()
     try:
         return jsonify(run_refresh(request.args.get("source", "manual")))
     except Exception as e:
@@ -865,6 +905,8 @@ def refresh():
 @app.route("/refresh-async", methods=["GET"])
 def refresh_async():
     """Asynchroner Endpunkt – antwortet sofort, arbeitet im Hintergrund (Standard: daily)."""
+    if not password_ok():
+        return denied()
     import threading
     source = request.args.get("source", "daily")
 
